@@ -15,7 +15,7 @@ from io import BytesIO
 # 系統設定
 # ============================================================
 st.set_page_config(
-    page_title="學校座標查詢系統 v3.1",
+    page_title="學校座標查詢系統 v3.2",
     page_icon="🏫",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -69,10 +69,7 @@ def normalize_school_name(name):
         return ""
     name = name.strip()
     name = re.sub(r'\s+', '', name)
-    replacements = {
-        '臺北縣': '新北市',
-        '桃園縣': '桃園市',
-    }
+    replacements = {'臺北縣': '新北市', '桃園縣': '桃園市'}
     for old, new in replacements.items():
         if old in name:
             name = name.replace(old, new)
@@ -106,14 +103,10 @@ def generate_search_variants(name):
             variants.append(city + name)
     
     type_map = {
-        '國小': ['國民小學', '小學'],
-        '國民小學': ['國小', '小學'],
-        '國中': ['國民中學', '中學'],
-        '國民中學': ['國中'],
-        '高中': ['高級中學', '高級中等學校'],
-        '高級中學': ['高中'],
-        '高工': ['高級工業職業學校'],
-        '高商': ['高級商業職業學校'],
+        '國小': ['國民小學', '小學'], '國民小學': ['國小', '小學'],
+        '國中': ['國民中學', '中學'], '國民中學': ['國中'],
+        '高中': ['高級中學', '高級中等學校'], '高級中學': ['高中'],
+        '高工': ['高級工業職業學校'], '高商': ['高級商業職業學校'],
     }
     for short_form, long_forms in type_map.items():
         if short_form in name:
@@ -124,11 +117,9 @@ def generate_search_variants(name):
 
 def haversine(lon1, lat1, lon2, lat2):
     lon1, lat1, lon2, lat2 = map(radians, [lon1, lat1, lon2, lat2])
-    dlon = lon2 - lon1
-    dlat = lat2 - lat1
+    dlon, dlat = lon2 - lon1, lat2 - lat1
     a = sin(dlat/2)**2 + cos(lat1) * cos(lat2) * sin(dlon/2)**2
-    c = 2 * asin(sqrt(a))
-    return 6371 * c
+    return 6371 * 2 * asin(sqrt(a))
 
 # ============================================================
 # Excel 工具
@@ -141,117 +132,67 @@ def df_to_excel_bytes(df):
     return output.getvalue()
 
 def db_to_excel_bytes(db):
-    """座標資料庫 → Excel"""
     rows = []
     for name, info in sorted(db.items()):
         rows.append({
-            '學校名稱': name,
-            '緯度': info.get('lat'),
-            '經度': info.get('lon'),
-            '來源': info.get('source', ''),
-            '查詢詞': info.get('query', ''),
+            '學校名稱': name, '緯度': info.get('lat'), '經度': info.get('lon'),
+            '來源': info.get('source', ''), '查詢詞': info.get('query', ''),
             '更新時間': info.get('updated', '')
         })
-    df = pd.DataFrame(rows)
-    return df_to_excel_bytes(df)
+    return df_to_excel_bytes(pd.DataFrame(rows))
 
 def create_coord_sample_excel():
-    """建立座標匯入範例 Excel"""
     data = {
-        '學校名稱': ['臺北市大安國小', '新北市板橋國小', '桃園市中壢國小', '臺中市大同國小', '高雄市前鎮國小'],
-        '緯度': [25.0263, 25.0145, 24.9575, 24.1436, 22.5947],
-        '經度': [121.5437, 121.4590, 121.2253, 120.6811, 120.3300],
+        '學校名稱': ['臺北市大安國小', '新北市板橋國小', '桃園市中壢國小'],
+        '緯度': [25.0263, 25.0145, 24.9575],
+        '經度': [121.5437, 121.4590, 121.2253],
     }
     return pd.DataFrame(data)
 
 def excel_to_db(df, col_name, col_lat, col_lon):
-    """Excel DataFrame → 資料庫格式 dict"""
-    imported = {}
-    errors = []
-    success = 0
-    
+    imported, errors, success = {}, [], 0
     for idx, row in df.iterrows():
         name = str(row[col_name]).strip() if pd.notna(row[col_name]) else ''
         if not name:
             continue
-        
         try:
-            lat = float(row[col_lat])
-            lon = float(row[col_lon])
+            lat, lon = float(row[col_lat]), float(row[col_lon])
         except (ValueError, TypeError):
             errors.append(f"第 {idx+2} 行：{name} 座標格式錯誤")
             continue
-        
         if not (21.0 < lat < 26.0 and 119.0 < lon < 123.0):
             errors.append(f"第 {idx+2} 行：{name} 座標超出台灣範圍 ({lat}, {lon})")
             continue
-        
-        normalized = normalize_school_name(name)
-        imported[normalized] = {
-            'lat': lat,
-            'lon': lon,
-            'source': 'excel_import',
+        imported[normalize_school_name(name)] = {
+            'lat': lat, 'lon': lon, 'source': 'excel_import',
             'updated': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         }
         success += 1
-    
     return imported, success, errors
 
 def detect_columns(df):
-    """自動偵測欄位"""
     result = {'id': None, 'name': None, 'school': None}
-    
-    id_keywords = ['學號', '座號', '編號', 'id', 'ID', '序號']
     for col in df.columns:
-        for kw in id_keywords:
-            if kw in str(col):
-                result['id'] = col
-                break
-        if result['id']:
-            break
-    
-    name_keywords = ['姓名', '名字', '學生', 'name']
-    for col in df.columns:
-        for kw in name_keywords:
-            if kw in str(col) and '學校' not in str(col):
-                result['name'] = col
-                break
-        if result['name']:
-            break
-    
-    school_keywords = ['學校', '校名', '畢業', '國小', '國中', '就讀', 'school']
-    for col in df.columns:
-        for kw in school_keywords:
-            if kw in str(col):
-                result['school'] = col
-                break
-        if result['school']:
-            break
-    
+        col_s = str(col)
+        if not result['id'] and any(k in col_s for k in ['學號', '座號', '編號', 'id', 'ID', '序號']):
+            result['id'] = col
+        if not result['name'] and any(k in col_s for k in ['姓名', '名字', '學生', 'name']) and '學校' not in col_s:
+            result['name'] = col
+        if not result['school'] and any(k in col_s for k in ['學校', '校名', '畢業', '國小', '國中', '就讀', 'school']):
+            result['school'] = col
     return result
 
 def detect_coord_columns(df):
-    """自動偵測座標欄位"""
     result = {'school': None, 'lat': None, 'lon': None}
-    
     for col in df.columns:
-        col_str = str(col).strip().lower()
-        if any(kw in col_str for kw in ['學校', '校名', 'school', '名稱']):
+        col_s = str(col).strip().lower()
+        if any(k in col_s for k in ['學校', '校名', 'school', '名稱']):
             result['school'] = col
-        elif any(kw in col_str for kw in ['緯度', 'lat', '北緯', 'latitude']):
+        elif any(k in col_s for k in ['緯度', 'lat', '北緯', 'latitude']):
             result['lat'] = col
-        elif any(kw in col_str for kw in ['經度', 'lon', 'lng', '東經', 'longitude']):
+        elif any(k in col_s for k in ['經度', 'lon', 'lng', '東經', 'longitude']):
             result['lon'] = col
-    
     return result
-
-def create_student_sample_excel():
-    data = {
-        '學號': ['S001', 'S002', 'S003', 'S004', 'S005'],
-        '姓名': ['王小明', '李小華', '張小美', '陳小強', '林小玲'],
-        '畢業國小': ['臺北市大安國小', '新北市板橋國小', '桃園市中壢國小', '臺中市西區大同國小', '高雄市前鎮國小']
-    }
-    return pd.DataFrame(data)
 
 # ============================================================
 # 地理編碼引擎
@@ -259,69 +200,67 @@ def create_student_sample_excel():
 class GeocodingEngine:
     def __init__(self):
         self.session = requests.Session()
-        self.session.headers.update({
-            'User-Agent': 'SchoolGeocoder/3.1 (Educational Research)'
-        })
+        self.session.headers.update({'User-Agent': 'SchoolGeocoder/3.2 (Educational Research)'})
         self.lock = threading.Lock()
         self.search_log = load_search_log()
     
-    def _log_search(self, name, result, engine, elapsed):
+    def _log(self, name, result, engine, elapsed):
         entry = {
             'time': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-            'name': name,
-            'success': result is not None,
-            'engine': engine,
-            'elapsed': round(elapsed, 3)
+            'name': name, 'success': result is not None,
+            'engine': engine, 'elapsed': round(elapsed, 3)
         }
         if result:
-            entry['lat'] = result[0]
-            entry['lon'] = result[1]
+            entry['lat'], entry['lon'] = result
         with self.lock:
             self.search_log.append(entry)
     
     def search_nominatim(self, query):
         try:
-            url = "https://nominatim.openstreetmap.org/search"
-            params = {'q': query, 'format': 'json', 'limit': 3, 'countrycodes': 'tw', 'addressdetails': 1}
-            resp = self.session.get(url, params=params, timeout=10)
-            if resp.status_code == 200:
+            resp = self.session.get(
+                "https://nominatim.openstreetmap.org/search",
+                params={'q': query, 'format': 'json', 'limit': 3, 'countrycodes': 'tw', 'addressdetails': 1},
+                timeout=10
+            )
+            if resp.status_code == 200 and resp.json():
                 data = resp.json()
-                if data:
-                    for item in data:
-                        if item.get('class') == 'amenity' and item.get('type') == 'school':
-                            return (float(item['lat']), float(item['lon']))
-                    return (float(data[0]['lat']), float(data[0]['lon']))
+                for item in data:
+                    if item.get('class') == 'amenity' and item.get('type') == 'school':
+                        return (float(item['lat']), float(item['lon']))
+                return (float(data[0]['lat']), float(data[0]['lon']))
         except:
             pass
         return None
     
     def search_photon(self, query):
         try:
-            url = "https://photon.komoot.io/api/"
-            params = {'q': query + ' Taiwan', 'limit': 3, 'lang': 'zh'}
-            resp = self.session.get(url, params=params, timeout=10)
+            resp = self.session.get(
+                "https://photon.komoot.io/api/",
+                params={'q': query + ' Taiwan', 'limit': 3, 'lang': 'zh'},
+                timeout=10
+            )
             if resp.status_code == 200:
-                data = resp.json()
-                features = data.get('features', [])
+                features = resp.json().get('features', [])
                 if features:
                     for f in features:
                         if f.get('properties', {}).get('osm_value') == 'school':
-                            coords = f['geometry']['coordinates']
-                            return (coords[1], coords[0])
-                    coords = features[0]['geometry']['coordinates']
-                    return (coords[1], coords[0])
+                            c = f['geometry']['coordinates']
+                            return (c[1], c[0])
+                    c = features[0]['geometry']['coordinates']
+                    return (c[1], c[0])
         except:
             pass
         return None
     
-    def search_osm_structured(self, query):
+    def search_osm(self, query):
         try:
-            url = "https://nominatim.openstreetmap.org/search"
-            params = {'q': query, 'format': 'json', 'limit': 5, 'countrycodes': 'tw'}
-            resp = self.session.get(url, params=params, timeout=10)
+            resp = self.session.get(
+                "https://nominatim.openstreetmap.org/search",
+                params={'q': query, 'format': 'json', 'limit': 5, 'countrycodes': 'tw'},
+                timeout=10
+            )
             if resp.status_code == 200:
-                data = resp.json()
-                for item in data:
+                for item in resp.json():
                     lat, lon = float(item['lat']), float(item['lon'])
                     if 21.5 < lat < 25.5 and 119.5 < lon < 122.5:
                         return (lat, lon)
@@ -329,65 +268,55 @@ class GeocodingEngine:
             pass
         return None
     
-    def geocode_school(self, school_name, db):
-        start_time = time.time()
+    def geocode(self, school_name, db):
+        t0 = time.time()
         normalized = normalize_school_name(school_name)
         
+        # 資料庫查找
         if normalized in db:
-            entry = db[normalized]
-            elapsed = time.time() - start_time
-            self._log_search(school_name, (entry['lat'], entry['lon']), 'database', elapsed)
-            return {'name': school_name, 'normalized': normalized,
-                    'lat': entry['lat'], 'lon': entry['lon'], 'source': 'database', 'success': True}
+            e = db[normalized]
+            self._log(school_name, (e['lat'], e['lon']), 'database', time.time()-t0)
+            return {'name': school_name, 'lat': e['lat'], 'lon': e['lon'], 'source': 'database', 'success': True}
         
-        variants = generate_search_variants(normalized)
-        for v in variants:
-            v_norm = normalize_school_name(v)
-            if v_norm in db:
-                entry = db[v_norm]
-                elapsed = time.time() - start_time
-                self._log_search(school_name, (entry['lat'], entry['lon']), 'database_variant', elapsed)
-                return {'name': school_name, 'normalized': normalized,
-                        'lat': entry['lat'], 'lon': entry['lon'], 'source': 'database (variant)', 'success': True}
+        for v in generate_search_variants(normalized):
+            vn = normalize_school_name(v)
+            if vn in db:
+                e = db[vn]
+                self._log(school_name, (e['lat'], e['lon']), 'database_variant', time.time()-t0)
+                return {'name': school_name, 'lat': e['lat'], 'lon': e['lon'], 'source': 'database', 'success': True}
         
-        engines = [
-            ('Nominatim', self.search_nominatim),
-            ('Photon', self.search_photon),
-            ('OSM', self.search_osm_structured),
-        ]
+        # 線上查詢
+        engines = [('Nominatim', self.search_nominatim), ('Photon', self.search_photon), ('OSM', self.search_osm)]
+        variants = generate_search_variants(normalized)[:4]
         
-        for engine_name, engine_func in engines:
-            for variant in variants[:4]:
+        for eng_name, eng_func in engines:
+            for variant in variants:
                 try:
-                    result = engine_func(variant)
+                    result = eng_func(variant)
                     if result:
                         lat, lon = result
                         if 21.5 < lat < 25.5 and 119.5 < lon < 122.5:
                             db[normalized] = {
-                                'lat': lat, 'lon': lon, 'source': engine_name,
+                                'lat': lat, 'lon': lon, 'source': eng_name,
                                 'query': variant, 'updated': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
                             }
-                            elapsed = time.time() - start_time
-                            self._log_search(school_name, (lat, lon), engine_name, elapsed)
-                            return {'name': school_name, 'normalized': normalized,
-                                    'lat': lat, 'lon': lon, 'source': engine_name, 'success': True}
+                            self._log(school_name, (lat, lon), eng_name, time.time()-t0)
+                            return {'name': school_name, 'lat': lat, 'lon': lon, 'source': eng_name, 'success': True}
                     time.sleep(API_DELAY)
                 except:
                     time.sleep(API_DELAY)
         
-        elapsed = time.time() - start_time
-        self._log_search(school_name, None, 'all_failed', elapsed)
-        return {'name': school_name, 'normalized': normalized,
-                'lat': None, 'lon': None, 'source': 'not_found', 'success': False}
+        self._log(school_name, None, 'all_failed', time.time()-t0)
+        return {'name': school_name, 'lat': None, 'lon': None, 'source': 'not_found', 'success': False}
 
 # ============================================================
 # 主介面
 # ============================================================
 def main():
-    # 側邊欄
+    # ====== 側邊欄 ======
     with st.sidebar:
         st.title("🏫 學校座標查詢系統")
-        st.caption("v3.1 Excel 匯入匯出版")
+        st.caption("v3.2 保留原始格式版")
         st.divider()
         
         db = load_database()
@@ -404,9 +333,7 @@ def main():
         
         st.divider()
         
-        # ============================
-        # 座標資料庫 Excel 匯出
-        # ============================
+        # 座標資料庫 匯出
         st.markdown("### 📥 匯出座標資料庫")
         if db:
             st.download_button(
@@ -416,337 +343,296 @@ def main():
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 use_container_width=True
             )
-            st.caption(f"共 {len(db)} 筆座標資料")
         else:
             st.info("資料庫為空")
         
         st.divider()
         
-        # ============================
-        # 座標資料庫 Excel 匯入
-        # ============================
+        # 座標資料庫 匯入
         st.markdown("### 📤 匯入座標資料庫")
-        
-        # 範例下載
         sample_coord_df = create_coord_sample_excel()
         st.download_button(
-            "📋 下載匯入範例 (Excel)",
+            "📋 下載匯入範例",
             data=df_to_excel_bytes(sample_coord_df),
             file_name="座標匯入範例.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             use_container_width=True
         )
         
-        uploaded_coord = st.file_uploader(
-            "上傳座標 Excel",
-            type=['xlsx', 'xls'],
-            key='coord_import',
-            help="需包含：學校名稱、緯度、經度 三個欄位"
-        )
+        uploaded_coord = st.file_uploader("上傳座標 Excel", type=['xlsx', 'xls'], key='coord_import')
         
         if uploaded_coord:
             try:
-                if uploaded_coord.name.endswith('.xls'):
-                    df_coord = pd.read_excel(uploaded_coord, engine='xlrd')
-                else:
-                    df_coord = pd.read_excel(uploaded_coord, engine='openpyxl')
+                eng = 'xlrd' if uploaded_coord.name.endswith('.xls') else 'openpyxl'
+                df_coord = pd.read_excel(uploaded_coord, engine=eng)
+                st.success(f"讀取 {len(df_coord)} 筆")
                 
-                st.success(f"讀取到 {len(df_coord)} 筆，{len(df_coord.columns)} 欄")
-                
-                # 自動偵測欄位
                 detected = detect_coord_columns(df_coord)
                 cols = list(df_coord.columns)
                 
-                coord_school_col = st.selectbox(
-                    "學校名稱欄位",
-                    cols,
-                    index=cols.index(detected['school']) if detected['school'] in cols else 0,
-                    key='coord_school_col'
-                )
-                coord_lat_col = st.selectbox(
-                    "緯度欄位",
-                    cols,
-                    index=cols.index(detected['lat']) if detected['lat'] in cols else min(1, len(cols)-1),
-                    key='coord_lat_col'
-                )
-                coord_lon_col = st.selectbox(
-                    "經度欄位",
-                    cols,
-                    index=cols.index(detected['lon']) if detected['lon'] in cols else min(2, len(cols)-1),
-                    key='coord_lon_col'
-                )
+                coord_school_col = st.selectbox("學校名稱欄位", cols,
+                    index=cols.index(detected['school']) if detected['school'] in cols else 0, key='cs_col')
+                coord_lat_col = st.selectbox("緯度欄位", cols,
+                    index=cols.index(detected['lat']) if detected['lat'] in cols else min(1, len(cols)-1), key='cl_col')
+                coord_lon_col = st.selectbox("經度欄位", cols,
+                    index=cols.index(detected['lon']) if detected['lon'] in cols else min(2, len(cols)-1), key='co_col')
                 
-                import_mode = st.radio(
-                    "匯入模式",
-                    ["合併（保留既有，新增/覆蓋匯入的）", "僅新增（不覆蓋已有）"],
-                    key='import_mode'
-                )
+                import_mode = st.radio("匯入模式", ["合併（覆蓋）", "僅新增（不覆蓋）"], key='imp_mode')
                 
                 if st.button("✅ 確認匯入", type="primary", use_container_width=True):
-                    imported, success_cnt, errors = excel_to_db(
-                        df_coord, coord_school_col, coord_lat_col, coord_lon_col
-                    )
-                    
+                    imported, success_cnt, errors = excel_to_db(df_coord, coord_school_col, coord_lat_col, coord_lon_col)
                     if import_mode.startswith("僅新增"):
-                        new_count = 0
+                        new_c = sum(1 for k in imported if k not in db)
                         for k, v in imported.items():
                             if k not in db:
                                 db[k] = v
-                                new_count += 1
                         save_database(db)
-                        st.success(f"✅ 新增 {new_count} 筆（跳過已有 {success_cnt - new_count} 筆）")
+                        st.success(f"✅ 新增 {new_c} 筆")
                     else:
                         db.update(imported)
                         save_database(db)
-                        st.success(f"✅ 匯入成功！合併 {success_cnt} 筆，資料庫共 {len(db)} 筆")
-                    
+                        st.success(f"✅ 合併 {success_cnt} 筆，共 {len(db)} 筆")
                     if errors:
                         with st.expander(f"⚠️ {len(errors)} 筆錯誤"):
                             for e in errors:
                                 st.write(e)
-                    
                     st.rerun()
-            
             except Exception as e:
                 st.error(f"讀取失敗：{e}")
         
         st.divider()
-        
-        # JSON 備份（進階）
         with st.expander("🔧 JSON 備份（進階）"):
             if db:
-                db_json = json.dumps(db, ensure_ascii=False, indent=2)
-                st.download_button(
-                    "JSON 匯出",
-                    data=db_json,
-                    file_name=f"school_db_{datetime.now().strftime('%Y%m%d')}.json",
-                    mime="application/json",
-                    use_container_width=True
-                )
-            
-            uploaded_json = st.file_uploader("JSON 匯入", type=['json'], key='json_import')
-            if uploaded_json:
+                st.download_button("JSON 匯出", data=json.dumps(db, ensure_ascii=False, indent=2),
+                    file_name=f"school_db_{datetime.now().strftime('%Y%m%d')}.json", mime="application/json",
+                    use_container_width=True)
+            up_json = st.file_uploader("JSON 匯入", type=['json'], key='json_imp')
+            if up_json:
                 try:
-                    imported = json.loads(uploaded_json.read().decode('utf-8'))
-                    if isinstance(imported, dict):
-                        db.update(imported)
+                    imp = json.loads(up_json.read().decode('utf-8'))
+                    if isinstance(imp, dict):
+                        db.update(imp)
                         save_database(db)
-                        st.success(f"✅ JSON 匯入成功！共 {len(db)} 筆")
+                        st.success(f"✅ JSON 匯入 {len(db)} 筆")
                         st.rerun()
                 except Exception as e:
-                    st.error(f"JSON 匯入失敗：{e}")
+                    st.error(f"失敗：{e}")
     
-    # ============================
-    # 主頁面標籤
-    # ============================
+    # ====== 主頁面 ======
     tab1, tab2, tab3, tab4, tab5 = st.tabs([
-        "📤 上傳學生資料",
-        "🗺️ 地圖",
-        "📊 統計分析",
-        "✏️ 手動編輯",
-        "🔧 進階工具"
+        "📤 上傳學生資料", "🗺️ 地圖", "📊 統計分析", "✏️ 手動編輯", "🔧 進階工具"
     ])
     
     # ========================================
-    # Tab 1: 上傳學生資料
+    # Tab 1: 上傳 → 保留原始格式 + 附加經緯度
     # ========================================
     with tab1:
         st.header("📤 上傳學生資料")
         
-        col_s1, col_s2 = st.columns([1, 3])
-        with col_s1:
-            sample_df = create_student_sample_excel()
-            st.download_button(
-                "📋 下載範例 Excel",
-                data=df_to_excel_bytes(sample_df),
-                file_name="範例_學生資料.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-            )
-        with col_s2:
-            st.info("💡 上傳包含學校名稱的 Excel，系統自動查詢座標並匯出結果")
+        st.info("💡 系統會**完整保留**您上傳的 Excel 所有欄位，只在最後附加「緯度」「經度」兩欄")
         
-        uploaded_file = st.file_uploader(
-            "上傳學生資料",
-            type=['xlsx', 'xls'],
-            help="支援 .xlsx 和 .xls 格式"
-        )
+        uploaded_file = st.file_uploader("上傳學生資料 Excel", type=['xlsx', 'xls'], help="支援 .xlsx / .xls")
         
         if uploaded_file:
             try:
-                if uploaded_file.name.endswith('.xls'):
-                    df_raw = pd.read_excel(uploaded_file, engine='xlrd')
-                else:
-                    df_raw = pd.read_excel(uploaded_file, engine='openpyxl')
+                eng = 'xlrd' if uploaded_file.name.endswith('.xls') else 'openpyxl'
+                df_original = pd.read_excel(uploaded_file, engine=eng)
                 
-                st.success(f"✅ 讀取成功：{len(df_raw)} 筆，{len(df_raw.columns)} 欄")
+                st.success(f"✅ 讀取成功：{len(df_original)} 筆 × {len(df_original.columns)} 欄")
                 
-                with st.expander("📋 資料預覽（前 10 筆）", expanded=True):
-                    st.dataframe(df_raw.head(10), use_container_width=True)
+                with st.expander("📋 原始資料預覽（前 10 筆）", expanded=True):
+                    st.dataframe(df_original.head(10), use_container_width=True)
                 
-                # 欄位對應
-                st.subheader("🔗 欄位對應")
-                detected = detect_columns(df_raw)
+                # 只需選擇「學校名稱」欄位
+                st.subheader("🔗 選擇學校名稱欄位")
+                detected = detect_columns(df_original)
+                cols_list = list(df_original.columns)
                 
-                col_m1, col_m2, col_m3 = st.columns(3)
-                columns_list = ['（不使用）'] + list(df_raw.columns)
+                school_default = cols_list.index(detected['school']) if detected['school'] in cols_list else 0
+                school_col = st.selectbox(
+                    "⭐ 哪一欄是學校名稱？",
+                    cols_list,
+                    index=school_default,
+                    help="系統會根據這一欄查詢經緯度"
+                )
                 
-                with col_m1:
-                    id_default = columns_list.index(detected['id']) if detected['id'] in columns_list else 0
-                    id_col = st.selectbox("學號/座號", columns_list, index=id_default)
-                with col_m2:
-                    name_default = columns_list.index(detected['name']) if detected['name'] in columns_list else 0
-                    name_col = st.selectbox("姓名", columns_list, index=name_default)
-                with col_m3:
-                    school_default = columns_list.index(detected['school']) if detected['school'] in columns_list else 0
-                    school_col = st.selectbox("⭐ 學校名稱（必選）", columns_list, index=school_default)
+                # 預覽該欄
+                sample_schools = df_original[school_col].dropna().unique()[:8]
+                st.write("該欄範例值：", " / ".join([str(s) for s in sample_schools]))
                 
-                if school_col == '（不使用）':
-                    st.warning("⚠️ 請選擇「學校名稱」欄位")
-                else:
-                    result_data = []
-                    for idx, row in df_raw.iterrows():
-                        entry = {'原始索引': idx}
-                        if id_col != '（不使用）':
-                            entry['學號'] = row[id_col]
-                        if name_col != '（不使用）':
-                            entry['姓名'] = row[name_col]
-                        entry['學校名稱'] = str(row[school_col]).strip() if pd.notna(row[school_col]) else ''
-                        result_data.append(entry)
+                # 統計
+                valid_count = df_original[school_col].notna().sum()
+                unique_count = df_original[school_col].nunique()
+                st.write(f"📊 有效 **{valid_count}** 筆，不重複學校 **{unique_count}** 所")
+                
+                col_b1, col_b2 = st.columns([1, 3])
+                with col_b1:
+                    start_search = st.button("🚀 開始查詢座標", type="primary", use_container_width=True)
+                with col_b2:
+                    workers = st.slider("並行查詢數", 1, 6, MAX_WORKERS)
+                
+                if start_search:
+                    db = load_database()
+                    engine = GeocodingEngine()
                     
-                    df_work = pd.DataFrame(result_data)
-                    df_work = df_work[df_work['學校名稱'].str.len() > 0]
-                    st.write(f"📊 有效資料：**{len(df_work)}** 筆")
+                    # 取得不重複學校
+                    unique_schools = [str(s).strip() for s in df_original[school_col].dropna().unique() if str(s).strip()]
                     
-                    col_b1, col_b2 = st.columns([1, 3])
-                    with col_b1:
-                        start_search = st.button("🚀 開始查詢座標", type="primary", use_container_width=True)
-                    with col_b2:
-                        workers = st.slider("並行數", 1, 6, MAX_WORKERS)
+                    progress_bar = st.progress(0)
+                    status_text = st.empty()
                     
-                    if start_search:
-                        db = load_database()
-                        engine = GeocodingEngine()
-                        unique_schools = df_work['學校名稱'].unique().tolist()
-                        st.write(f"🏫 不重複學校：**{len(unique_schools)}** 所")
+                    school_coords = {}  # 學校 → (lat, lon)
+                    success_count = 0
+                    fail_count = 0
+                    t0 = time.time()
+                    
+                    # 先查資料庫
+                    to_search = []
+                    for school in unique_schools:
+                        normalized = normalize_school_name(school)
+                        found = False
                         
-                        progress_bar = st.progress(0)
-                        status_text = st.empty()
+                        if normalized in db:
+                            school_coords[school] = (db[normalized]['lat'], db[normalized]['lon'])
+                            success_count += 1
+                            found = True
                         
-                        school_results = {}
-                        success_count = 0
-                        fail_count = 0
-                        start_time = time.time()
-                        to_search = []
+                        if not found:
+                            for v in generate_search_variants(normalized):
+                                vn = normalize_school_name(v)
+                                if vn in db:
+                                    school_coords[school] = (db[vn]['lat'], db[vn]['lon'])
+                                    success_count += 1
+                                    found = True
+                                    break
                         
-                        for school in unique_schools:
-                            normalized = normalize_school_name(school)
-                            found = False
-                            if normalized in db:
-                                school_results[school] = {
-                                    'lat': db[normalized]['lat'],
-                                    'lon': db[normalized]['lon'],
-                                    'source': 'database'
-                                }
-                                success_count += 1
-                                found = True
-                            if not found:
-                                for v in generate_search_variants(normalized):
-                                    v_norm = normalize_school_name(v)
-                                    if v_norm in db:
-                                        school_results[school] = {
-                                            'lat': db[v_norm]['lat'],
-                                            'lon': db[v_norm]['lon'],
-                                            'source': 'database (variant)'
-                                        }
-                                        success_count += 1
-                                        found = True
-                                        break
-                            if not found:
-                                to_search.append(school)
-                        
-                        status_text.write(f"📦 資料庫命中：{success_count} | 需查詢：{len(to_search)}")
-                        
-                        if to_search:
-                            completed = 0
-                            with ThreadPoolExecutor(max_workers=workers) as executor:
-                                futures = {executor.submit(engine.geocode_school, s, db): s for s in to_search}
-                                for future in as_completed(futures):
-                                    result = future.result()
-                                    completed += 1
-                                    if result['success']:
-                                        school_results[result['name']] = {
-                                            'lat': result['lat'], 'lon': result['lon'], 'source': result['source']
-                                        }
-                                        success_count += 1
-                                    else:
-                                        fail_count += 1
-                                    
-                                    progress_bar.progress(min((success_count + fail_count) / len(unique_schools), 1.0))
-                                    elapsed = time.time() - start_time
-                                    status_text.write(
-                                        f"⏱️ {elapsed:.1f}s | ✅ {success_count} | ❌ {fail_count} | 🔄 {completed}/{len(to_search)}"
-                                    )
-                        
-                        save_database(db)
-                        save_search_log(engine.search_log)
-                        progress_bar.progress(1.0)
-                        total_time = time.time() - start_time
-                        status_text.write(f"🎉 完成！{total_time:.1f}秒 | ✅ {success_count} | ❌ {fail_count}")
-                        
-                        lat_list, lon_list, source_list = [], [], []
-                        for _, row in df_work.iterrows():
-                            school = row['學校名稱']
-                            if school in school_results:
-                                lat_list.append(school_results[school]['lat'])
-                                lon_list.append(school_results[school]['lon'])
-                                source_list.append(school_results[school]['source'])
-                            else:
-                                lat_list.append(None)
-                                lon_list.append(None)
-                                source_list.append('not_found')
-                        
-                        df_work['緯度'] = lat_list
-                        df_work['經度'] = lon_list
-                        df_work['來源'] = source_list
-                        
-                        st.session_state['result_df'] = df_work
-                        st.session_state['school_results'] = school_results
-                        
-                        st.subheader("📋 查詢結果")
-                        df_success = df_work[df_work['緯度'].notna()]
-                        df_fail = df_work[df_work['緯度'].isna()]
-                        
-                        tab_s, tab_f = st.tabs([f"✅ 成功 ({len(df_success)})", f"❌ 未找到 ({len(df_fail)})"])
-                        with tab_s:
-                            if len(df_success) > 0:
-                                st.dataframe(df_success, use_container_width=True)
-                        with tab_f:
-                            if len(df_fail) > 0:
-                                st.dataframe(df_fail, use_container_width=True)
-                                st.info("💡 可在「手動編輯」分頁手動輸入座標")
-                        
-                        st.subheader("📥 下載結果")
-                        col_d1, col_d2 = st.columns(2)
-                        with col_d1:
+                        if not found:
+                            to_search.append(school)
+                    
+                    status_text.write(f"📦 資料庫命中 {success_count} 所 | 需線上查詢 {len(to_search)} 所")
+                    
+                    # 線上查詢
+                    if to_search:
+                        completed = 0
+                        with ThreadPoolExecutor(max_workers=workers) as executor:
+                            futures = {executor.submit(engine.geocode, s, db): s for s in to_search}
+                            for future in as_completed(futures):
+                                result = future.result()
+                                completed += 1
+                                if result['success']:
+                                    school_coords[result['name']] = (result['lat'], result['lon'])
+                                    success_count += 1
+                                else:
+                                    fail_count += 1
+                                
+                                total = success_count + fail_count
+                                progress_bar.progress(min(total / len(unique_schools), 1.0))
+                                elapsed = time.time() - t0
+                                status_text.write(
+                                    f"⏱️ {elapsed:.1f}s | ✅ {success_count} | ❌ {fail_count} | 🔄 {completed}/{len(to_search)}"
+                                )
+                    
+                    save_database(db)
+                    save_search_log(engine.search_log)
+                    progress_bar.progress(1.0)
+                    total_time = time.time() - t0
+                    
+                    st.success(f"🎉 完成！{total_time:.1f} 秒 | ✅ {success_count} 所 | ❌ {fail_count} 所")
+                    
+                    # ============================
+                    # 核心：在原始 DataFrame 後面加兩欄
+                    # ============================
+                    df_result = df_original.copy()
+                    
+                    lat_list = []
+                    lon_list = []
+                    for _, row in df_original.iterrows():
+                        school = str(row[school_col]).strip() if pd.notna(row[school_col]) else ''
+                        if school in school_coords:
+                            lat_list.append(school_coords[school][0])
+                            lon_list.append(school_coords[school][1])
+                        else:
+                            lat_list.append(None)
+                            lon_list.append(None)
+                    
+                    df_result['緯度'] = lat_list
+                    df_result['經度'] = lon_list
+                    
+                    # 存到 session
+                    st.session_state['result_df'] = df_result
+                    st.session_state['school_col'] = school_col
+                    st.session_state['school_coords'] = school_coords
+                    
+                    # 預覽
+                    st.subheader("📋 結果預覽")
+                    
+                    found_mask = df_result['緯度'].notna()
+                    
+                    tab_ok, tab_fail = st.tabs([
+                        f"✅ 已配對 ({found_mask.sum()})",
+                        f"❌ 未找到 ({(~found_mask).sum()})"
+                    ])
+                    
+                    with tab_ok:
+                        if found_mask.sum() > 0:
+                            st.dataframe(df_result[found_mask].head(50), use_container_width=True)
+                    with tab_fail:
+                        if (~found_mask).sum() > 0:
+                            st.dataframe(df_result[~found_mask].head(50), use_container_width=True)
+                            st.info("💡 可到「手動編輯」分頁補上座標後重新下載")
+                    
+                    # ============================
+                    # 下載：完全保留原始格式 + 附加經緯度
+                    # ============================
+                    st.subheader("📥 下載結果")
+                    
+                    st.markdown(f"""
+                    ```
+                    原始檔案欄位: {' | '.join(str(c) for c in df_original.columns)}
+                    ＋ 附加欄位:  緯度 | 經度
+                    總欄數: {len(df_original.columns)} → {len(df_result.columns)}
+                    ```
+                    """)
+                    
+                    col_d1, col_d2 = st.columns(2)
+                    with col_d1:
+                        st.download_button(
+                            "📥 下載完整結果 (Excel)",
+                            data=df_to_excel_bytes(df_result),
+                            file_name=f"學生資料_含座標_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
+                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                            use_container_width=True,
+                            type="primary"
+                        )
+                    with col_d2:
+                        df_not_found = df_result[~found_mask]
+                        if len(df_not_found) > 0:
                             st.download_button(
-                                "📥 完整結果 (Excel)",
-                                data=df_to_excel_bytes(df_work),
-                                file_name=f"座標結果_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
+                                f"📥 未配對清單 ({len(df_not_found)} 筆)",
+                                data=df_to_excel_bytes(df_not_found),
+                                file_name=f"未配對_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
                                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                                 use_container_width=True
                             )
-                        with col_d2:
-                            if len(df_fail) > 0:
-                                st.download_button(
-                                    "📥 未找到清單 (Excel)",
-                                    data=df_to_excel_bytes(df_fail),
-                                    file_name=f"未找到_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
-                                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                                    use_container_width=True
-                                )
+            
             except Exception as e:
                 st.error(f"❌ 讀取失敗：{e}")
                 st.info("請確認是有效的 Excel 格式（.xlsx 或 .xls）")
+        
+        # 如果之前已有結果，顯示下載按鈕
+        elif 'result_df' in st.session_state:
+            st.divider()
+            st.subheader("📥 上次查詢結果仍可下載")
+            df_prev = st.session_state['result_df']
+            found_mask = df_prev['緯度'].notna()
+            st.write(f"共 {len(df_prev)} 筆 | ✅ {found_mask.sum()} | ❌ {(~found_mask).sum()}")
+            st.download_button(
+                "📥 下載結果 (Excel)",
+                data=df_to_excel_bytes(df_prev),
+                file_name=f"學生資料_含座標_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True
+            )
     
     # ========================================
     # Tab 2: 地圖
@@ -758,6 +644,7 @@ def main():
             st.info("📤 請先在「上傳學生資料」查詢座標")
         else:
             df_map = st.session_state['result_df']
+            school_col = st.session_state.get('school_col', '')
             df_valid = df_map[df_map['緯度'].notna() & df_map['經度'].notna()].copy()
             
             if len(df_valid) == 0:
@@ -770,31 +657,26 @@ def main():
                     
                     map_type = st.radio("地圖模式", ["標記地圖", "聚合地圖", "熱力圖"], horizontal=True)
                     
-                    center_lat = df_valid['緯度'].mean()
-                    center_lon = df_valid['經度'].mean()
+                    center_lat, center_lon = df_valid['緯度'].mean(), df_valid['經度'].mean()
                     m = folium.Map(location=[center_lat, center_lon], zoom_start=8)
                     
                     if map_type == "標記地圖":
                         for _, row in df_valid.iterrows():
-                            popup = f"🏫 {row['學校名稱']}"
-                            if '姓名' in row and pd.notna(row.get('姓名')):
-                                popup += f"<br>👤 {row['姓名']}"
+                            name = str(row[school_col]) if school_col and pd.notna(row.get(school_col)) else '未知'
                             folium.CircleMarker(
                                 location=[row['緯度'], row['經度']], radius=6,
-                                popup=folium.Popup(popup, max_width=200),
-                                tooltip=row['學校名稱'],
+                                popup=folium.Popup(f"🏫 {name}", max_width=200),
+                                tooltip=name,
                                 color='#3388ff', fill=True, fillColor='#3388ff', fillOpacity=0.7
                             ).add_to(m)
                     elif map_type == "聚合地圖":
                         cluster = MarkerCluster().add_to(m)
                         for _, row in df_valid.iterrows():
-                            popup = f"🏫 {row['學校名稱']}"
-                            if '姓名' in row and pd.notna(row.get('姓名')):
-                                popup += f"<br>👤 {row['姓名']}"
+                            name = str(row[school_col]) if school_col and pd.notna(row.get(school_col)) else '未知'
                             folium.Marker(
                                 location=[row['緯度'], row['經度']],
-                                popup=folium.Popup(popup, max_width=200),
-                                tooltip=row['學校名稱']
+                                popup=folium.Popup(f"🏫 {name}", max_width=200),
+                                tooltip=name
                             ).add_to(cluster)
                     else:
                         HeatMap(df_valid[['緯度', '經度']].values.tolist(), radius=15).add_to(m)
@@ -814,6 +696,7 @@ def main():
             st.info("📤 請先查詢座標")
         else:
             df_stats = st.session_state['result_df']
+            school_col = st.session_state.get('school_col', '')
             df_valid = df_stats[df_stats['緯度'].notna()].copy()
             
             if len(df_valid) == 0:
@@ -821,43 +704,44 @@ def main():
             else:
                 c1, c2, c3, c4 = st.columns(4)
                 with c1: st.metric("總筆數", len(df_stats))
-                with c2: st.metric("成功查詢", len(df_valid))
-                with c3: st.metric("不重複學校", df_valid['學校名稱'].nunique())
+                with c2: st.metric("已配對", len(df_valid))
+                with c3: st.metric("不重複學校", df_valid[school_col].nunique() if school_col else '–')
                 with c4:
                     rate = len(df_valid) / len(df_stats) * 100 if len(df_stats) > 0 else 0
-                    st.metric("成功率", f"{rate:.1f}%")
+                    st.metric("配對率", f"{rate:.1f}%")
                 
-                st.divider()
-                st.subheader("🏫 各學校學生數")
-                school_counts = df_valid['學校名稱'].value_counts()
-                st.bar_chart(school_counts.head(20))
-                
-                with st.expander(f"完整列表（{len(school_counts)} 所）"):
-                    st.dataframe(
-                        pd.DataFrame({'學校': school_counts.index, '學生數': school_counts.values}),
-                        use_container_width=True
-                    )
-                
-                st.divider()
-                st.subheader("📍 區域分布")
-                
-                def get_region(name):
-                    regions = {
-                        '臺北': '臺北市', '台北': '臺北市', '新北': '新北市', '桃園': '桃園市',
-                        '臺中': '臺中市', '台中': '臺中市', '臺南': '臺南市', '台南': '臺南市',
-                        '高雄': '高雄市', '基隆': '基隆市', '新竹': '新竹', '苗栗': '苗栗縣',
-                        '彰化': '彰化縣', '南投': '南投縣', '雲林': '雲林縣', '嘉義': '嘉義',
-                        '屏東': '屏東縣', '宜蘭': '宜蘭縣', '花蓮': '花蓮縣',
-                        '臺東': '臺東縣', '台東': '臺東縣', '澎湖': '澎湖縣',
-                        '金門': '金門縣', '連江': '連江縣',
-                    }
-                    for key, region in regions.items():
-                        if key in str(name):
-                            return region
-                    return '其他'
-                
-                df_valid['區域'] = df_valid['學校名稱'].apply(get_region)
-                st.bar_chart(df_valid['區域'].value_counts())
+                if school_col:
+                    st.divider()
+                    st.subheader("🏫 各學校學生數")
+                    school_counts = df_valid[school_col].value_counts()
+                    st.bar_chart(school_counts.head(20))
+                    
+                    with st.expander(f"完整列表（{len(school_counts)} 所）"):
+                        st.dataframe(
+                            pd.DataFrame({'學校': school_counts.index, '學生數': school_counts.values}),
+                            use_container_width=True
+                        )
+                    
+                    st.divider()
+                    st.subheader("📍 區域分布")
+                    
+                    def get_region(name):
+                        regions = {
+                            '臺北': '臺北市', '台北': '臺北市', '新北': '新北市', '桃園': '桃園市',
+                            '臺中': '臺中市', '台中': '臺中市', '臺南': '臺南市', '台南': '臺南市',
+                            '高雄': '高雄市', '基隆': '基隆市', '新竹': '新竹', '苗栗': '苗栗縣',
+                            '彰化': '彰化縣', '南投': '南投縣', '雲林': '雲林縣', '嘉義': '嘉義',
+                            '屏東': '屏東縣', '宜蘭': '宜蘭縣', '花蓮': '花蓮縣',
+                            '臺東': '臺東縣', '台東': '臺東縣', '澎湖': '澎湖縣',
+                            '金門': '金門縣', '連江': '連江縣',
+                        }
+                        for key, region in regions.items():
+                            if key in str(name):
+                                return region
+                        return '其他'
+                    
+                    df_valid['區域'] = df_valid[school_col].apply(get_region)
+                    st.bar_chart(df_valid['區域'].value_counts())
                 
                 st.divider()
                 st.subheader("📏 距離分析")
@@ -867,8 +751,8 @@ def main():
                 if st.button("計算距離"):
                     distances = [haversine(ref_lon, ref_lat, row['經度'], row['緯度']) for _, row in df_valid.iterrows()]
                     df_valid['距離(km)'] = [round(d, 2) for d in distances]
-                    st.write(f"平均：**{sum(distances)/len(distances):.2f}** km | "
-                            f"最近：**{min(distances):.2f}** km | 最遠：**{max(distances):.2f}** km")
+                    st.write(f"平均 **{sum(distances)/len(distances):.2f}** km | "
+                            f"最近 **{min(distances):.2f}** km | 最遠 **{max(distances):.2f}** km")
                     
                     bins = [0, 5, 10, 20, 50, 100, float('inf')]
                     labels = ['0-5km', '5-10km', '10-20km', '20-50km', '50-100km', '100km+']
@@ -883,7 +767,7 @@ def main():
         
         db = load_database()
         
-        st.subheader("➕ 新增/修改")
+        st.subheader("➕ 新增/修改學校座標")
         ce1, ce2, ce3 = st.columns([2, 1, 1])
         with ce1: edit_name = st.text_input("學校名稱", placeholder="例：臺北市大安國小")
         with ce2: edit_lat = st.number_input("緯度", value=25.0330, format="%.6f", key='ed_lat')
@@ -891,8 +775,7 @@ def main():
         
         if st.button("💾 儲存", type="primary"):
             if edit_name:
-                normalized = normalize_school_name(edit_name)
-                db[normalized] = {
+                db[normalize_school_name(edit_name)] = {
                     'lat': edit_lat, 'lon': edit_lon, 'source': 'manual',
                     'updated': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
                 }
@@ -902,23 +785,65 @@ def main():
         
         st.divider()
         
+        # 顯示未找到的學校（從結果中）
         if 'result_df' in st.session_state:
-            df_fail = st.session_state['result_df'][st.session_state['result_df']['緯度'].isna()]
-            if len(df_fail) > 0:
-                st.subheader(f"❌ 未找到的學校（{len(df_fail)} 筆）")
-                for school in df_fail['學校名稱'].unique():
-                    with st.expander(f"🏫 {school}"):
-                        cf1, cf2 = st.columns(2)
-                        with cf1: fix_lat = st.number_input("緯度", value=25.0, format="%.6f", key=f"fl_{school}")
-                        with cf2: fix_lon = st.number_input("經度", value=121.5, format="%.6f", key=f"fo_{school}")
-                        st.markdown(f"🔍 [Google Maps 搜尋](https://www.google.com/maps/search/{school})")
-                        if st.button(f"儲存 {school}", key=f"sv_{school}"):
-                            db[normalize_school_name(school)] = {
-                                'lat': fix_lat, 'lon': fix_lon, 'source': 'manual_fix',
-                                'updated': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                            }
-                            save_database(db)
-                            st.success(f"✅ 已儲存 {school}")
+            df_r = st.session_state['result_df']
+            school_col = st.session_state.get('school_col', '')
+            if school_col:
+                df_fail = df_r[df_r['緯度'].isna()]
+                if len(df_fail) > 0:
+                    st.subheader(f"❌ 未配對的學校（{df_fail[school_col].nunique()} 所）")
+                    for school in df_fail[school_col].unique():
+                        if pd.isna(school) or str(school).strip() == '':
+                            continue
+                        school_str = str(school).strip()
+                        with st.expander(f"🏫 {school_str}"):
+                            cf1, cf2 = st.columns(2)
+                            with cf1: fix_lat = st.number_input("緯度", value=25.0, format="%.6f", key=f"fl_{school_str}")
+                            with cf2: fix_lon = st.number_input("經度", value=121.5, format="%.6f", key=f"fo_{school_str}")
+                            st.markdown(f"🔍 [Google Maps 搜尋](https://www.google.com/maps/search/{school_str})")
+                            if st.button(f"儲存 {school_str}", key=f"sv_{school_str}"):
+                                db[normalize_school_name(school_str)] = {
+                                    'lat': fix_lat, 'lon': fix_lon, 'source': 'manual_fix',
+                                    'updated': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                                }
+                                save_database(db)
+                                st.success(f"✅ 已儲存 {school_str}")
+                    
+                    st.divider()
+                    if st.button("🔄 用更新的資料庫重新配對", type="primary"):
+                        db = load_database()
+                        school_coords = st.session_state.get('school_coords', {})
+                        
+                        # 重新配對
+                        for school in df_fail[school_col].unique():
+                            if pd.isna(school):
+                                continue
+                            school_str = str(school).strip()
+                            normalized = normalize_school_name(school_str)
+                            if normalized in db:
+                                school_coords[school_str] = (db[normalized]['lat'], db[normalized]['lon'])
+                        
+                        # 更新結果
+                        df_updated = st.session_state['result_df'].copy()
+                        lat_list, lon_list = [], []
+                        for _, row in df_updated.iterrows():
+                            s = str(row[school_col]).strip() if pd.notna(row.get(school_col)) else ''
+                            if s in school_coords:
+                                lat_list.append(school_coords[s][0])
+                                lon_list.append(school_coords[s][1])
+                            else:
+                                lat_list.append(None)
+                                lon_list.append(None)
+                        df_updated['緯度'] = lat_list
+                        df_updated['經度'] = lon_list
+                        
+                        st.session_state['result_df'] = df_updated
+                        st.session_state['school_coords'] = school_coords
+                        
+                        new_found = df_updated['緯度'].notna().sum()
+                        st.success(f"✅ 重新配對完成！已配對 {new_found}/{len(df_updated)} 筆")
+                        st.rerun()
         
         st.divider()
         st.subheader("📖 瀏覽資料庫")
@@ -938,7 +863,7 @@ def main():
             
             with st.expander("🗑️ 刪除"):
                 del_name = st.selectbox("選擇學校", sorted(db.keys()))
-                if st.button("刪除"):
+                if st.button("刪除", key='del_btn'):
                     del db[del_name]
                     save_database(db)
                     st.success(f"已刪除：{del_name}")
@@ -961,7 +886,7 @@ def main():
             progress = st.progress(0)
             results = []
             for i, school in enumerate(schools):
-                results.append(engine.geocode_school(school, db))
+                results.append(engine.geocode(school, db))
                 progress.progress((i + 1) / len(schools))
             save_database(db)
             save_search_log(engine.search_log)
