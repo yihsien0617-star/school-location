@@ -2,853 +2,805 @@ import streamlit as st
 import pandas as pd
 import json
 import os
-import re
 import time
-import urllib.parse
-import requests
-from geopy.geocoders import Nominatim
-import folium
-from streamlit_folium import st_folium
+import math
+import re
+from io import BytesIO
 
-# ==========================================
-# 頁面設定
-# ==========================================
+# === 必須是第一個 Streamlit 指令 ===
 st.set_page_config(
-    page_title="學校經緯度查詢與地圖視覺化",
-    page_icon="🗺️",
+    page_title="學校座標查詢系統",
+    page_icon="🏫",
     layout="wide"
 )
 
-st.title("🗺️ 學校經緯度查詢與地圖視覺化系統")
-st.markdown("上傳申請生資料，自動將畢業學校轉為經緯度並在地圖上呈現")
+# === 安全載入 requests ===
+try:
+    import requests
+    HAS_REQUESTS = True
+except ImportError:
+    HAS_REQUESTS = False
 
-# ==========================================
-# 常數
-# ==========================================
+# === 安全載入 geopy ===
+try:
+    from geopy.geocoders import Nominatim
+    from geopy.exc import GeocoderTimedOut, GeocoderServiceError
+    HAS_GEOPY = True
+except ImportError:
+    HAS_GEOPY = False
+
+# === 安全載入 folium ===
+try:
+    import folium
+    from folium.plugins import HeatMap, MarkerCluster
+    from streamlit_folium import st_folium
+    HAS_FOLIUM = True
+except ImportError:
+    HAS_FOLIUM = False
+
+# ============================
+# 資料庫管理
+# ============================
 DB_FILE = "school_coordinates_db.json"
-# 台灣經緯度範圍（過濾用）
-TW_LAT_MIN, TW_LAT_MAX = 21.5, 26.5
-TW_LON_MIN, TW_LON_MAX = 119.0, 123.0
 
-# ==========================================
-# 初始化
-# ==========================================
-def load_db():
+@st.cache_data
+def load_database_from_file():
+    """從檔案載入資料庫"""
     if os.path.exists(DB_FILE):
-        with open(DB_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
+        try:
+            with open(DB_FILE, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except:
+            return {}
     return {}
 
-def save_db(db):
+def get_database():
+    """取得資料庫（優先用 session_state）"""
+    if 'school_db' not in st.session_state:
+        st.session_state.school_db = load_database_from_file()
+    return st.session_state.school_db
+
+def save_database(db):
+    """儲存資料庫"""
+    st.session_state.school_db = db
     try:
-        with open(DB_FILE, "w", encoding="utf-8") as f:
+        with open(DB_FILE, 'w', encoding='utf-8') as f:
             json.dump(db, f, ensure_ascii=False, indent=2)
-    except Exception:
-        pass  # Streamlit Cloud 可能無法寫入
+    except:
+        pass
 
-if "school_db" not in st.session_state:
-    st.session_state.school_db = load_db()
-if "processed_df" not in st.session_state:
-    st.session_state.processed_df = None
-if "processing_log" not in st.session_state:
-    st.session_state.processing_log = []
-
-# ==========================================
-# 台灣座標驗證
-# ==========================================
-def is_in_taiwan(lat, lon):
-    """判斷座標是否在台灣範圍內"""
-    if lat is None or lon is None:
-        return False
-    return (TW_LAT_MIN <= lat <= TW_LAT_MAX and
-            TW_LON_MIN <= lon <= TW_LON_MAX)
-
-# ==========================================
+# ============================
 # 學校名稱正規化
-# ==========================================
-def normalize_school_name(name):
-    """正規化學校名稱"""
+# ============================
+def normalize_name(name):
+    """基本正規化"""
     if not name or not isinstance(name, str):
         return ""
     name = name.strip()
-    name = name.replace("　", "").replace(" ", "")
-    # 統一台/臺
-    name = name.replace("台", "臺")
+    name = name.replace("臺", "台")
+    name = re.sub(r'\s+', '', name)
     return name
 
-def generate_name_variants(school_name):
-    """
-    產生學校名稱的多種變體，用於搜尋
-    """
-    variants = []
-    name = school_name.strip()
-    variants.append(name)
-
-    # 台 <-> 臺
-    if "台" in name:
-        variants.append(name.replace("台", "臺"))
-    if "臺" in name:
-        variants.append(name.replace("臺", "台"))
-
-    # 移除/新增行政前綴
-    admin_prefixes = [
-        "國立", "私立", "市立", "縣立",
-        "臺北市立", "臺北市私立",
-        "新北市立", "新北市私立",
-        "桃園市立", "桃園市私立",
-        "臺中市立", "臺中市私立",
-        "臺南市立", "臺南市私立",
-        "高雄市立", "高雄市私立",
-        "基隆市立", "新竹市立", "新竹縣立",
-        "苗栗縣立", "彰化縣立", "南投縣立",
-        "雲林縣立", "嘉義市立", "嘉義縣立",
-        "屏東縣立", "宜蘭縣立", "花蓮縣立",
-        "臺東縣立", "澎湖縣立", "金門縣立",
-        "連江縣立",
+def generate_variants(name):
+    """產生學校名稱的各種變體"""
+    variants = set()
+    normalized = normalize_name(name)
+    if not normalized:
+        return variants
+    variants.add(normalized)
+    
+    # 台/臺 互換
+    if "台" in normalized:
+        variants.add(normalized.replace("台", "臺"))
+    if "臺" in normalized:
+        variants.add(normalized.replace("臺", "台"))
+    
+    # 移除常見前綴
+    for prefix in ["國立", "私立", "市立", "縣立"]:
+        for v in list(variants):
+            if v.startswith(prefix):
+                variants.add(v[len(prefix):])
+            else:
+                variants.add(prefix + v)
+    
+    # 簡稱/全稱互換
+    replacements = [
+        ("高級中學", "高中"),
+        ("高級商工職業學校", "高商"),
+        ("高級工業職業學校", "高工"),
+        ("高級商業職業學校", "高商"),
+        ("高級家事商業職業學校", "家商"),
+        ("高級農工職業學校", "農工"),
+        ("國民中學", "國中"),
+        ("國民小學", "國小"),
     ]
+    for full, short in replacements:
+        for v in list(variants):
+            if full in v:
+                variants.add(v.replace(full, short))
+            if short in v and full not in v:
+                variants.add(v.replace(short, full))
+    
+    return variants
 
-    base = name
-    for p in sorted(admin_prefixes, key=len, reverse=True):
-        if name.startswith(p):
-            base = name[len(p):]
-            break
-
-    variants.append(base)
-
-    # 簡稱對應：高級中學 <-> 高中
-    for v in list(variants):
-        if "高級中學" in v:
-            variants.append(v.replace("高級中學", "高中"))
-        if "高級中等學校" in v:
-            variants.append(v.replace("高級中等學校", "高中"))
-            variants.append(v.replace("高級中等學校", "高級中學"))
-        if "高中" in v and "高級" not in v:
-            variants.append(v.replace("高中", "高級中學"))
-
-    # 去重但保持順序
-    seen = set()
-    unique = []
-    for v in variants:
-        if v not in seen and v:
-            seen.add(v)
-            unique.append(v)
-    return unique
-
-# ==========================================
-# 模糊比對（查資料庫）
-# ==========================================
-def fuzzy_match_school(school_name, db):
-    """用多種變體去比對資料庫"""
-    variants = generate_name_variants(school_name)
-    # 再加上 台/臺 互換的所有組合
-    expanded = []
-    for v in variants:
-        expanded.append(v)
-        expanded.append(v.replace("台", "臺"))
-        expanded.append(v.replace("臺", "台"))
-    expanded = list(dict.fromkeys(expanded))  # 去重保序
-
-    for variant in expanded:
-        if variant in db:
-            return variant
-
-    # 最後嘗試子字串比對（學校核心名稱包含在資料庫 key 中）
-    core = school_name
-    for p in ["國立", "私立", "市立", "縣立"]:
-        if core.startswith(p):
-            core = core[len(p):]
-            break
-    core = core.replace("台", "臺")
-
-    if len(core) >= 4:
-        for db_name in db:
-            if core in db_name or db_name.endswith(core):
-                return db_name
-
-    return None
-
-# ==========================================
-# 引擎 1: Nominatim (OpenStreetMap)
-# ==========================================
-def search_nominatim(school_name):
-    """用 Nominatim 搜尋"""
+# ============================
+# 座標驗證（台灣範圍）
+# ============================
+def is_valid_taiwan_coordinate(lat, lon):
+    """檢查座標是否在台灣範圍內"""
     try:
-        geolocator = Nominatim(
-            user_agent="school_geocoder_tw_v2",
-            timeout=10
-        )
-        variants = generate_name_variants(school_name)
-        search_queries = []
-        for v in variants:
-            search_queries.append(f"{v}, Taiwan")
-            search_queries.append(f"台灣 {v}")
-            search_queries.append(v)
+        lat, lon = float(lat), float(lon)
+        return 21.5 <= lat <= 26.5 and 119.0 <= lon <= 123.0
+    except:
+        return False
 
-        for query in search_queries:
-            try:
-                location = geolocator.geocode(
-                    query,
-                    exactly_one=True,
-                    timeout=10
-                )
-                if location and is_in_taiwan(location.latitude, location.longitude):
-                    return location.latitude, location.longitude, "Nominatim"
-                time.sleep(0.3)
-            except Exception:
-                time.sleep(0.5)
-                continue
-    except Exception:
+# ============================
+# 搜尋引擎（加入超時保護）
+# ============================
+SEARCH_TIMEOUT = 5  # 每次搜尋最多等 5 秒
+
+def search_nominatim_basic(name):
+    """Nominatim 基本搜尋"""
+    if not HAS_GEOPY:
+        return None, None, None
+    try:
+        geolocator = Nominatim(user_agent="school_geocoder_tw_v2", timeout=SEARCH_TIMEOUT)
+        location = geolocator.geocode(name, exactly_one=True, country_codes="tw")
+        if location and is_valid_taiwan_coordinate(location.latitude, location.longitude):
+            return location.latitude, location.longitude, "Nominatim基本搜尋"
+    except:
         pass
     return None, None, None
 
-# ==========================================
-# 引擎 2: Nominatim structured query
-# ==========================================
-def search_nominatim_structured(school_name):
-    """用 Nominatim 結構化查詢"""
+def search_nominatim_structured(name):
+    """Nominatim 結構化搜尋"""
+    if not HAS_GEOPY:
+        return None, None, None
     try:
-        geolocator = Nominatim(
-            user_agent="school_geocoder_tw_struct_v2",
-            timeout=10
-        )
-
-        # 嘗試從學校名稱取出城市
-        city_patterns = [
-            (r"^(臺北市|台北市)", "臺北市"),
-            (r"^(新北市)", "新北市"),
-            (r"^(桃園市)", "桃園市"),
-            (r"^(臺中市|台中市)", "臺中市"),
-            (r"^(臺南市|台南市)", "臺南市"),
-            (r"^(高雄市)", "高雄市"),
-            (r"^(基隆市)", "基隆市"),
-            (r"^(新竹市)", "新竹市"),
-            (r"^(新竹縣)", "新竹縣"),
-            (r"^(苗栗縣)", "苗栗縣"),
-            (r"^(彰化縣)", "彰化縣"),
-            (r"^(南投縣)", "南投縣"),
-            (r"^(雲林縣)", "雲林縣"),
-            (r"^(嘉義市)", "嘉義市"),
-            (r"^(嘉義縣)", "嘉義縣"),
-            (r"^(屏東縣)", "屏東縣"),
-            (r"^(宜蘭縣)", "宜蘭縣"),
-            (r"^(花蓮縣)", "花蓮縣"),
-            (r"^(臺東縣|台東縣)", "臺東縣"),
-            (r"^(澎湖縣)", "澎湖縣"),
-            (r"^(金門縣)", "金門縣"),
-            (r"^(連江縣)", "連江縣"),
-        ]
-
-        city = None
-        for pattern, city_name in city_patterns:
-            if re.search(pattern, school_name.replace("台", "臺")):
-                city = city_name
-                break
-
-        if city:
-            location = geolocator.geocode(
-                query=school_name,
-                exactly_one=True,
-                timeout=10,
-                country_codes="tw"
-            )
-            if location and is_in_taiwan(location.latitude, location.longitude):
-                return location.latitude, location.longitude, "Nominatim(結構化)"
-            time.sleep(0.3)
-
-        # 不帶城市直接查
+        geolocator = Nominatim(user_agent="school_geocoder_tw_v3", timeout=SEARCH_TIMEOUT)
         location = geolocator.geocode(
-            query=school_name,
-            exactly_one=True,
-            timeout=10,
-            country_codes="tw"
+            query={"q": name, "countrycodes": "tw"},
+            exactly_one=True
         )
-        if location and is_in_taiwan(location.latitude, location.longitude):
-            return location.latitude, location.longitude, "Nominatim(country_code)"
-        time.sleep(0.3)
-
-    except Exception:
+        if location and is_valid_taiwan_coordinate(location.latitude, location.longitude):
+            return location.latitude, location.longitude, "Nominatim結構化搜尋"
+    except:
         pass
     return None, None, None
 
-# ==========================================
-# 引擎 3: Photon (Komoot 的免費 geocoder)
-# ==========================================
-def search_photon(school_name):
-    """用 Photon API (komoot) 搜尋"""
+def search_photon(name):
+    """Photon (Komoot) 搜尋"""
+    if not HAS_REQUESTS:
+        return None, None, None
     try:
-        variants = generate_name_variants(school_name)
-        for v in variants[:5]:  # 只試前5個變體
-            url = "https://photon.komoot.io/api/"
-            params = {
-                "q": f"{v} Taiwan",
-                "limit": 5,
-                "lat": 23.7,   # 台灣中心
-                "lon": 120.9,
-                "lang": "zh"
-            }
-            resp = requests.get(url, params=params, timeout=10)
-            if resp.status_code == 200:
-                data = resp.json()
-                features = data.get("features", [])
-                for feat in features:
-                    coords = feat.get("geometry", {}).get("coordinates", [])
-                    if len(coords) == 2:
-                        lon, lat = coords
-                        if is_in_taiwan(lat, lon):
-                            return lat, lon, "Photon"
-            time.sleep(0.3)
-    except Exception:
+        url = "https://photon.komoot.io/api/"
+        params = {
+            "q": name,
+            "limit": 1,
+            "lat": 23.5,
+            "lon": 121.0,
+            "lang": "zh"
+        }
+        resp = requests.get(url, params=params, timeout=SEARCH_TIMEOUT)
+        if resp.status_code == 200:
+            data = resp.json()
+            if data.get("features"):
+                coords = data["features"][0]["geometry"]["coordinates"]
+                lon, lat = coords[0], coords[1]
+                if is_valid_taiwan_coordinate(lat, lon):
+                    return lat, lon, "Photon搜尋"
+    except:
         pass
     return None, None, None
 
-# ==========================================
-# 引擎 4: OpenStreetMap Nominatim Search API (直接 HTTP)
-# ==========================================
-def search_osm_api(school_name):
-    """直接用 OSM Nominatim HTTP API"""
+def search_osm_api(name):
+    """OSM Nominatim HTTP API"""
+    if not HAS_REQUESTS:
+        return None, None, None
     try:
-        variants = generate_name_variants(school_name)
+        url = "https://nominatim.openstreetmap.org/search"
+        params = {
+            "q": name,
+            "format": "json",
+            "limit": 1,
+            "countrycodes": "tw",
+            "bounded": 1,
+            "viewbox": "119.0,26.5,123.0,21.5"
+        }
         headers = {"User-Agent": "SchoolGeocoderTW/2.0"}
-
-        for v in variants[:5]:
-            url = "https://nominatim.openstreetmap.org/search"
-            params = {
-                "q": f"{v}",
-                "format": "json",
-                "limit": 5,
-                "countrycodes": "tw",
-                "accept-language": "zh-TW"
-            }
-            resp = requests.get(url, params=params, headers=headers, timeout=10)
-            if resp.status_code == 200:
-                results = resp.json()
-                for r in results:
-                    lat = float(r["lat"])
-                    lon = float(r["lon"])
-                    if is_in_taiwan(lat, lon):
-                        return lat, lon, "OSM API"
-            time.sleep(1.0)  # Nominatim 要求 1秒間隔
-    except Exception:
+        resp = requests.get(url, params=params, headers=headers, timeout=SEARCH_TIMEOUT)
+        if resp.status_code == 200:
+            data = resp.json()
+            if data:
+                lat, lon = float(data[0]["lat"]), float(data[0]["lon"])
+                if is_valid_taiwan_coordinate(lat, lon):
+                    return lat, lon, "OSM API搜尋"
+    except:
         pass
     return None, None, None
 
-# ==========================================
-# 引擎 5: 政府資料開放平臺 / TGOS 概念
-#   實際用「學校名 + 地址」策略搜尋
-# ==========================================
-def search_with_address_hint(school_name):
+# ============================
+# 核心：查詢單一學校座標（帶分批機制）
+# ============================
+def lookup_school(name, db, use_online=True):
     """
-    嘗試「學校名+高中+地址」等組合搜尋
-    有些學校用地址比較容易找到
+    查詢學校座標
+    回傳: (lat, lon, source, matched_name)
     """
-    try:
-        geolocator = Nominatim(
-            user_agent="school_geocoder_addr_v2",
-            timeout=10
-        )
-
-        # 從學校名稱猜測所在城市，構建地址式查詢
-        name_clean = school_name.replace("國立", "").replace("私立", "")
-        name_clean = name_clean.replace("市立", "").replace("縣立", "")
-
-        # 取核心名稱（例如「建國高級中學」→「建國高中」）
-        core = name_clean
-        core = core.replace("高級中等學校", "高中")
-        core = core.replace("高級中學", "高中")
-
-        search_queries = [
-            f"{core} school Taiwan",
-            f"{school_name} 學校",
-        ]
-
-        for query in search_queries:
-            location = geolocator.geocode(query, timeout=10)
-            if location and is_in_taiwan(location.latitude, location.longitude):
-                return location.latitude, location.longitude, "地址推測"
-            time.sleep(0.5)
-
-    except Exception:
-        pass
-    return None, None, None
-
-# ==========================================
-# 主搜尋引擎：依序嘗試所有引擎
-# ==========================================
-def search_all_engines(school_name, progress_callback=None):
-    """
-    依序嘗試所有搜尋引擎
-    回傳 (lat, lon, source) 或 (None, None, None)
-    """
+    if not name or not isinstance(name, str):
+        return None, None, "無效名稱", None
+    
+    normalized = normalize_name(name)
+    
+    # 第一步：完全匹配資料庫
+    if normalized in db:
+        entry = db[normalized]
+        return entry["lat"], entry["lon"], "資料庫完全匹配", normalized
+    
+    # 第二步：變體匹配資料庫
+    variants = generate_variants(name)
+    for variant in variants:
+        if variant in db:
+            entry = db[variant]
+            return entry["lat"], entry["lon"], f"資料庫變體匹配({variant})", variant
+    
+    # 第三步：資料庫模糊搜尋
+    for db_name in db:
+        if normalized in db_name or db_name in normalized:
+            entry = db[db_name]
+            return entry["lat"], entry["lon"], f"資料庫模糊匹配({db_name})", db_name
+    
+    # 第四步：線上搜尋（如果啟用）
+    if not use_online:
+        return None, None, "僅離線模式-未找到", None
+    
+    search_queries = list(variants)[:5]  # 最多嘗試 5 個變體
+    
     engines = [
-        ("Nominatim 基本搜尋", search_nominatim),
-        ("Nominatim 結構化搜尋", search_nominatim_structured),
-        ("Photon (Komoot)", search_photon),
-        ("OSM API 直接搜尋", search_osm_api),
-        ("地址推測搜尋", search_with_address_hint),
+        ("Nominatim", search_nominatim_basic),
+        ("Photon", search_photon),
+        ("OSM API", search_osm_api),
     ]
-
-    for engine_name, engine_func in engines:
-        if progress_callback:
-            progress_callback(f"  → 嘗試 {engine_name}...")
-        try:
-            lat, lon, source = engine_func(school_name)
-            if lat is not None and lon is not None:
-                return lat, lon, source
-        except Exception as e:
-            if progress_callback:
-                progress_callback(f"  → {engine_name} 發生錯誤: {str(e)[:50]}")
-            continue
-
-    return None, None, None
-
-# ==========================================
-# 側邊欄：資料庫管理
-# ==========================================
-with st.sidebar:
-    st.header("📚 學校資料庫管理")
-    st.metric("目前收錄學校數", f"{len(st.session_state.school_db)} 所")
-    st.divider()
-
-    st.subheader("📥 匯入經緯度資料")
-    st.caption("CSV/Excel，需含學校名稱、緯度、經度欄位")
-    uploaded_db = st.file_uploader("選擇經緯度資料檔", type=["csv", "xlsx"], key="db_upload")
-
-    if uploaded_db:
-        if uploaded_db.name.endswith('.csv'):
-            df_import = pd.read_csv(uploaded_db)
-        else:
-            df_import = pd.read_excel(uploaded_db)
-
-        st.write(f"讀取到 {len(df_import)} 筆")
-        c1, c2, c3 = st.columns(3)
-        with c1:
-            school_col_imp = st.selectbox("學校名稱", df_import.columns, key="ic1")
-        with c2:
-            lat_col_imp = st.selectbox("緯度", df_import.columns, key="ic2")
-        with c3:
-            lon_col_imp = st.selectbox("經度", df_import.columns, key="ic3")
-
-        if st.button("🔄 匯入", type="primary"):
-            count = 0
-            for _, row in df_import.iterrows():
-                name = str(row[school_col_imp]).strip()
-                lat = row[lat_col_imp]
-                lon = row[lon_col_imp]
-                if pd.notna(lat) and pd.notna(lon) and name and name != "nan":
-                    st.session_state.school_db[name] = {
-                        "lat": float(lat), "lon": float(lon), "source": "手動匯入"
+    
+    for query in search_queries:
+        for engine_name, engine_func in engines:
+            try:
+                lat, lon, source = engine_func(query)
+                if lat is not None and lon is not None:
+                    # 成功！存入資料庫
+                    db[normalized] = {
+                        "lat": lat, "lon": lon,
+                        "source": source,
+                        "original_query": name
                     }
-                    count += 1
-            save_db(st.session_state.school_db)
-            st.success(f"✅ 匯入 {count} 所！")
-            st.rerun()
+                    save_database(db)
+                    return lat, lon, source, normalized
+            except:
+                pass
+            time.sleep(0.3)  # 縮短延遲，避免超時
+    
+    return None, None, "所有搜尋引擎均未找到", None
 
+# ============================
+# 🔑 關鍵修正：分批處理 + 不超時
+# ============================
+def process_batch(df, school_col, db, use_online, batch_size=5):
+    """
+    分批處理學校座標查詢
+    每批處理完就更新 session_state，避免超時
+    """
+    # 初始化處理狀態
+    if 'processing_state' not in st.session_state:
+        st.session_state.processing_state = {
+            'results': {},
+            'current_index': 0,
+            'is_complete': False
+        }
+    
+    state = st.session_state.processing_state
+    schools = df[school_col].tolist()
+    total = len(schools)
+    
+    if state['is_complete']:
+        return state['results']
+    
+    # 計算本批次範圍
+    start_idx = state['current_index']
+    end_idx = min(start_idx + batch_size, total)
+    
+    # 進度顯示
+    progress_bar = st.progress(start_idx / total if total > 0 else 0)
+    status_text = st.empty()
+    log_area = st.empty()
+    
+    logs = []
+    
+    for i in range(start_idx, end_idx):
+        school_name = str(schools[i]).strip()
+        status_text.text(f"處理中: {school_name} ({i+1}/{total})")
+        progress_bar.progress((i + 1) / total)
+        
+        lat, lon, source, matched = lookup_school(school_name, db, use_online)
+        
+        state['results'][i] = {
+            'lat': lat, 'lon': lon,
+            'source': source, 'matched': matched
+        }
+        
+        status_icon = "✅" if lat else "❌"
+        logs.append(f"{status_icon} {school_name} → {source}")
+        log_area.text_area("處理記錄", "\n".join(logs[-10:]), height=150)
+    
+    # 更新索引
+    state['current_index'] = end_idx
+    
+    if end_idx >= total:
+        state['is_complete'] = True
+        status_text.text(f"✅ 全部完成！共 {total} 筆")
+        progress_bar.progress(1.0)
+    else:
+        remaining = total - end_idx
+        status_text.text(f"⏳ 已處理 {end_idx}/{total}，剩餘 {remaining} 筆。點擊「繼續處理」按鈕...")
+    
+    st.session_state.processing_state = state
+    return state['results'] if state['is_complete'] else None
+
+# ============================
+# 地區分類
+# ============================
+def classify_region(lat, lon):
+    """根據座標分類地區"""
+    try:
+        lat, lon = float(lat), float(lon)
+    except:
+        return "未知"
+    
+    if lat >= 24.4:
+        if lon < 121.3:
+            return "北部"
+        else:
+            return "東部"
+    elif lat >= 23.0:
+        if lon < 120.8:
+            return "中部"
+        else:
+            return "東部"
+    elif lat >= 22.0:
+        return "南部"
+    else:
+        if lon < 120.0:
+            return "離島"
+        return "南部"
+
+# ============================
+# 主介面
+# ============================
+st.title("🏫 學校座標查詢系統")
+
+# 載入資料庫
+db = get_database()
+
+# ============================
+# 側邊欄
+# ============================
+with st.sidebar:
+    st.header("📊 資料庫管理")
+    st.metric("資料庫學校數", len(db))
+    
     st.divider()
+    
+    # 匯入資料庫
+    st.subheader("📥 匯入座標資料庫")
+    uploaded_db = st.file_uploader("上傳 JSON 資料庫", type=["json"], key="db_upload")
+    if uploaded_db:
+        try:
+            new_db = json.load(uploaded_db)
+            db.update(new_db)
+            save_database(db)
+            st.success(f"匯入成功！新增/更新 {len(new_db)} 筆")
+            st.rerun()
+        except Exception as e:
+            st.error(f"匯入失敗: {e}")
+    
+    # 匯入 CSV 座標
+    st.subheader("📥 從 CSV 匯入座標")
+    uploaded_csv_db = st.file_uploader("上傳含座標的 CSV", type=["csv"], key="csv_db_upload")
+    if uploaded_csv_db:
+        try:
+            csv_db = pd.read_csv(uploaded_csv_db)
+            st.write("欄位:", list(csv_db.columns))
+            col_name = st.selectbox("學校名稱欄位", csv_db.columns, key="csv_db_name")
+            col_lat = st.selectbox("緯度欄位", csv_db.columns, key="csv_db_lat")
+            col_lon = st.selectbox("經度欄位", csv_db.columns, key="csv_db_lon")
+            if st.button("匯入座標", key="btn_import_csv"):
+                count = 0
+                for _, row in csv_db.iterrows():
+                    name = normalize_name(str(row[col_name]))
+                    try:
+                        lat, lon = float(row[col_lat]), float(row[col_lon])
+                        if is_valid_taiwan_coordinate(lat, lon) and name:
+                            db[name] = {"lat": lat, "lon": lon, "source": "CSV匯入"}
+                            count += 1
+                    except:
+                        pass
+                save_database(db)
+                st.success(f"匯入 {count} 筆座標")
+                st.rerun()
+        except Exception as e:
+            st.error(f"讀取失敗: {e}")
+    
+    st.divider()
+    
+    # 搜尋資料庫
+    st.subheader("🔍 搜尋資料庫")
+    search_term = st.text_input("輸入學校名稱關鍵字")
+    if search_term:
+        results = {k: v for k, v in db.items() if search_term in k}
+        if results:
+            for name, info in list(results.items())[:10]:
+                st.write(f"📍 {name}: ({info['lat']:.4f}, {info['lon']:.4f})")
+        else:
+            st.write("未找到相關學校")
+    
+    st.divider()
+    
+    # 匯出資料庫
     st.subheader("📤 匯出資料庫")
-    if st.session_state.school_db:
-        db_exp = pd.DataFrame([
-            {"學校名稱": k, "緯度": v["lat"], "經度": v["lon"], "來源": v.get("source", "")}
-            for k, v in st.session_state.school_db.items()
-        ])
+    if db:
+        db_json = json.dumps(db, ensure_ascii=False, indent=2)
         st.download_button(
-            "⬇️ 下載資料庫 CSV",
-            data=db_exp.to_csv(index=False).encode("utf-8-sig"),
-            file_name="school_db_export.csv",
-            mime="text/csv"
+            "💾 下載資料庫 JSON",
+            db_json,
+            "school_coordinates_db.json",
+            "application/json"
         )
 
-    st.divider()
-    st.subheader("🔎 搜尋資料庫")
-    search_term = st.text_input("關鍵字搜尋")
-    if search_term:
-        results = {k: v for k, v in st.session_state.school_db.items() if search_term in k}
-        if results:
-            for name, info in list(results.items())[:20]:
-                st.write(f"📍 **{name}** ({info['lat']:.4f}, {info['lon']:.4f})")
-        else:
-            st.write("找不到")
-
-# ==========================================
-# 主功能區 Tabs
-# ==========================================
+# ============================
+# 主要分頁
+# ============================
 tab1, tab2, tab3, tab4 = st.tabs([
-    "📁 上傳與轉換", "🗺️ 地圖視覺化", "📊 統計分析", "✏️ 手動編輯"
+    "📤 上傳轉檔", "🗺️ 地圖視覺化", "📊 統計分析", "✏️ 手動編輯"
 ])
 
-# ==========================================
-# Tab 1: 上傳與轉換
-# ==========================================
+# ============================
+# Tab 1: 上傳轉檔
+# ============================
 with tab1:
-    st.header("📁 上傳申請生資料")
-
+    st.header("📤 上傳學校資料並轉換座標")
+    
     uploaded_file = st.file_uploader(
-        "請上傳 CSV 或 Excel 檔案",
-        type=["csv", "xlsx"],
+        "上傳 CSV 或 Excel 檔案",
+        type=["csv", "xlsx", "xls"],
         key="main_upload"
     )
-
+    
     if uploaded_file:
-        if uploaded_file.name.endswith('.csv'):
-            df = pd.read_csv(uploaded_file)
-        else:
-            df = pd.read_excel(uploaded_file)
-
-        st.success(f"✅ 讀取 **{len(df)}** 筆資料，欄位：{list(df.columns)}")
-
-        school_column = st.selectbox(
-            "請選擇「畢業學校」欄位",
-            df.columns,
-            index=list(df.columns).index("畢業學校") if "畢業學校" in df.columns else 0
-        )
-
-        with st.expander("👀 預覽前 10 筆"):
-            st.dataframe(df.head(10))
-
-        # ===== 開始轉換 =====
-        if st.button("🚀 開始轉換經緯度（含自動上網搜尋）", type="primary"):
-
-            unique_schools = df[school_column].dropna().unique()
-            total = len(unique_schools)
-            st.write(f"共 **{total}** 所不重複學校，開始處理...")
-
-            found = {}
-            not_found = []
-            log = []
-
-            progress_bar = st.progress(0)
-            status_text = st.empty()
-            detail_container = st.empty()
-
-            for i, school in enumerate(unique_schools):
-                school = str(school).strip()
-                pct = (i + 1) / total
-                progress_bar.progress(pct)
-                status_text.text(f"({i+1}/{total}) 處理: {school}")
-
-                # ---------- Step 1: 資料庫直接查 ----------
-                if school in st.session_state.school_db:
-                    info = st.session_state.school_db[school]
-                    found[school] = (info["lat"], info["lon"])
-                    log.append(f"✅ [資料庫] {school}")
-                    continue
-
-                # 正規化後再查一次
-                norm = normalize_school_name(school)
-                if norm in st.session_state.school_db:
-                    info = st.session_state.school_db[norm]
-                    st.session_state.school_db[school] = {
-                        "lat": info["lat"], "lon": info["lon"],
-                        "source": f"正規化→{norm}"
-                    }
-                    found[school] = (info["lat"], info["lon"])
-                    log.append(f"✅ [正規化] {school} → {norm}")
-                    continue
-
-                # ---------- Step 2: 模糊比對 ----------
-                match = fuzzy_match_school(school, st.session_state.school_db)
-                if match:
-                    info = st.session_state.school_db[match]
-                    st.session_state.school_db[school] = {
-                        "lat": info["lat"], "lon": info["lon"],
-                        "source": f"模糊比對→{match}"
-                    }
-                    found[school] = (info["lat"], info["lon"])
-                    log.append(f"🔗 [模糊比對] {school} → {match}")
-                    continue
-
-                # ---------- Step 3: 多引擎線上搜尋 ----------
-                log.append(f"🔍 [線上搜尋] {school}...")
-                detail_container.info(f"🌐 正在上網搜尋: **{school}**（使用多個搜尋引擎）")
-
-                def log_progress(msg):
-                    log.append(f"   {msg}")
-
-                lat, lon, source = search_all_engines(school, progress_callback=log_progress)
-
-                if lat is not None and lon is not None:
-                    st.session_state.school_db[school] = {
-                        "lat": lat, "lon": lon,
-                        "source": f"線上查詢({source})"
-                    }
-                    found[school] = (lat, lon)
-                    log.append(f"✅ [線上成功] {school} → ({lat:.4f}, {lon:.4f}) via {source}")
-                else:
-                    not_found.append(school)
-                    log.append(f"❌ [全部失敗] {school}")
-
-                time.sleep(0.3)
-
-            # ===== 處理完成 =====
-            save_db(st.session_state.school_db)
-            progress_bar.progress(1.0)
-            detail_container.empty()
-            status_text.text("✅ 全部處理完成！")
-
-            # 對應回原始資料
-            def get_lat(s):
-                s = str(s).strip()
-                if s in st.session_state.school_db:
-                    return st.session_state.school_db[s]["lat"]
-                m = fuzzy_match_school(s, st.session_state.school_db)
-                if m:
-                    return st.session_state.school_db[m]["lat"]
-                return None
-
-            def get_lon(s):
-                s = str(s).strip()
-                if s in st.session_state.school_db:
-                    return st.session_state.school_db[s]["lon"]
-                m = fuzzy_match_school(s, st.session_state.school_db)
-                if m:
-                    return st.session_state.school_db[m]["lon"]
-                return None
-
-            df["學校緯度"] = df[school_column].map(get_lat)
-            df["學校經度"] = df[school_column].map(get_lon)
-
-            st.session_state.processed_df = df
-            st.session_state.processing_log = log
-
-            # 結果統計
-            success = total - len(not_found)
-            c1, c2, c3, c4 = st.columns(4)
-            c1.metric("總學校數", total)
-            c2.metric("✅ 成功", success)
-            c3.metric("❌ 失敗", len(not_found))
-            c4.metric("成功率", f"{success/total*100:.1f}%")
-
-            # 搜尋紀錄
-            with st.expander("📋 完整搜尋紀錄", expanded=False):
-                for l in log:
-                    if l.startswith("✅"):
-                        st.markdown(f"<span style='color:green'>{l}</span>", unsafe_allow_html=True)
-                    elif l.startswith("❌"):
-                        st.markdown(f"<span style='color:red'>{l}</span>", unsafe_allow_html=True)
-                    elif l.startswith("🔗"):
-                        st.markdown(f"<span style='color:blue'>{l}</span>", unsafe_allow_html=True)
-                    elif l.startswith("🔍"):
-                        st.markdown(f"<span style='color:orange'>{l}</span>", unsafe_allow_html=True)
-                    else:
-                        st.text(l)
-
-            # 找不到的學校
-            if not_found:
-                st.warning(f"⚠️ 以下 {len(not_found)} 所學校所有引擎都搜尋不到：")
-                nf_df = pd.DataFrame({
-                    "學校名稱": not_found,
-                    "資料筆數": [len(df[df[school_column] == s]) for s in not_found]
-                })
-                st.dataframe(nf_df, hide_index=True)
-
-                missing_csv = pd.DataFrame({
-                    "學校名稱": not_found, "緯度": "", "經度": ""
-                })
-                st.download_button(
-                    "⬇️ 下載待補清單 CSV（填完後可從左側匯入）",
-                    data=missing_csv.to_csv(index=False).encode("utf-8-sig"),
-                    file_name="待補經緯度學校.csv",
-                    mime="text/csv"
+        # 讀取檔案
+        try:
+            if uploaded_file.name.endswith('.csv'):
+                df = pd.read_csv(uploaded_file)
+            else:
+                df = pd.read_excel(uploaded_file)
+            
+            st.success(f"成功讀取 {len(df)} 筆資料")
+            st.dataframe(df.head(), use_container_width=True)
+            
+            # 選擇欄位
+            col1, col2 = st.columns(2)
+            with col1:
+                school_col = st.selectbox("🏫 學校名稱欄位", df.columns)
+            with col2:
+                student_col = st.selectbox(
+                    "👥 學生數欄位（選填）",
+                    ["無"] + list(df.columns)
                 )
-
-    # 下載結果
-    if st.session_state.processed_df is not None:
-        st.divider()
-        st.subheader("📥 下載轉換結果")
-        result_csv = st.session_state.processed_df.to_csv(index=False).encode("utf-8-sig")
-        st.download_button(
-            "⬇️ 下載含經緯度的完整資料 (CSV)",
-            data=result_csv,
-            file_name="申請生資料_含經緯度.csv",
-            mime="text/csv",
-            type="primary"
-        )
-        with st.expander("👀 預覽轉換結果"):
-            st.dataframe(st.session_state.processed_df.head(20))
-
-# ==========================================
-# Tab 2: 地圖視覺化
-# ==========================================
-with tab2:
-    st.header("🗺️ 學校分布地圖")
-
-    if st.session_state.processed_df is not None:
-        df_map = st.session_state.processed_df.dropna(subset=["學校緯度", "學校經度"])
-
-        if len(df_map) == 0:
-            st.warning("沒有座標可顯示")
-        else:
-            col_ctrl, col_map = st.columns([1, 3])
-
-            with col_ctrl:
-                map_style = st.selectbox(
-                    "底圖", ["OpenStreetMap", "CartoDB positron", "CartoDB dark_matter"]
-                )
-                marker_size = st.slider("標記大小", 3, 15, 6)
-                show_heatmap = st.checkbox("依學生人數縮放", value=True)
-
-            with col_map:
-                school_col = "畢業學校" if "畢業學校" in df_map.columns else df_map.columns[0]
-                school_counts = (
-                    df_map.groupby([school_col, "學校緯度", "學校經度"])
-                    .size().reset_index(name="學生人數")
-                )
-
-                m = folium.Map(location=[23.7, 120.9], zoom_start=8, tiles=map_style)
-
-                for _, row in school_counts.iterrows():
-                    if show_heatmap:
-                        r = max(marker_size, row["學生人數"] * 2)
-                        folium.CircleMarker(
-                            location=[row["學校緯度"], row["學校經度"]],
-                            radius=r,
-                            popup=f"{row[school_col]}<br>學生: {row['學生人數']}",
-                            tooltip=f"{row[school_col]} ({row['學生人數']}人)",
-                            color="crimson", fill=True,
-                            fill_color="crimson", fill_opacity=0.5
-                        ).add_to(m)
-                    else:
-                        folium.Marker(
-                            location=[row["學校緯度"], row["學校經度"]],
-                            popup=f"{row[school_col]}<br>學生: {row['學生人數']}",
-                            tooltip=f"{row[school_col]} ({row['學生人數']}人)"
-                        ).add_to(m)
-
-                st_folium(m, width=800, height=600)
-
-            st.subheader("📊 各校學生人數")
-            st.dataframe(
-                school_counts.sort_values("學生人數", ascending=False),
-                use_container_width=True, hide_index=True
+            
+            # 搜尋選項
+            st.subheader("⚙️ 搜尋設定")
+            use_online = st.checkbox("啟用線上搜尋（較慢但更完整）", value=True)
+            
+            batch_size = st.slider(
+                "每批處理筆數（數字越小越不容易超時）",
+                min_value=1, max_value=20, value=5
             )
-    else:
-        st.info("👈 請先在「上傳與轉換」完成轉換")
+            
+            # === 關鍵：分批處理按鈕 ===
+            col_btn1, col_btn2, col_btn3 = st.columns(3)
+            
+            with col_btn1:
+                start_btn = st.button("🚀 開始處理", type="primary")
+            with col_btn2:
+                continue_btn = st.button("⏩ 繼續處理")
+            with col_btn3:
+                reset_btn = st.button("🔄 重新開始")
+            
+            if reset_btn:
+                if 'processing_state' in st.session_state:
+                    del st.session_state.processing_state
+                if 'result_df' in st.session_state:
+                    del st.session_state.result_df
+                st.rerun()
+            
+            if start_btn:
+                # 重設處理狀態
+                st.session_state.processing_state = {
+                    'results': {},
+                    'current_index': 0,
+                    'is_complete': False
+                }
+            
+            # 執行處理
+            if start_btn or continue_btn:
+                if 'processing_state' not in st.session_state:
+                    st.session_state.processing_state = {
+                        'results': {},
+                        'current_index': 0,
+                        'is_complete': False
+                    }
+                
+                results = process_batch(df, school_col, db, use_online, batch_size)
+                
+                if results is not None:
+                    # 處理完成，組裝結果
+                    lats, lons, sources = [], [], []
+                    for i in range(len(df)):
+                        r = results.get(i, {})
+                        lats.append(r.get('lat'))
+                        lons.append(r.get('lon'))
+                        sources.append(r.get('source', '未處理'))
+                    
+                    result_df = df.copy()
+                    result_df['緯度'] = lats
+                    result_df['經度'] = lons
+                    result_df['座標來源'] = sources
+                    
+                    if student_col != "無":
+                        result_df['學生數'] = pd.to_numeric(df[student_col], errors='coerce').fillna(0).astype(int)
+                    
+                    st.session_state.result_df = result_df
+                    st.session_state.school_col = school_col
+                    st.session_state.student_col = student_col
+                else:
+                    # 尚未完成
+                    state = st.session_state.processing_state
+                    st.warning(f"已處理 {state['current_index']}/{len(df)} 筆，請點擊「⏩ 繼續處理」")
+            
+            # 顯示結果
+            if 'result_df' in st.session_state:
+                result_df = st.session_state.result_df
+                
+                st.divider()
+                st.subheader("📋 處理結果")
+                
+                # 統計
+                found = result_df['緯度'].notna().sum()
+                total = len(result_df)
+                missing = total - found
+                
+                col_s1, col_s2, col_s3, col_s4 = st.columns(4)
+                col_s1.metric("總筆數", total)
+                col_s2.metric("成功", found)
+                col_s3.metric("失敗", missing)
+                col_s4.metric("成功率", f"{found/total*100:.1f}%" if total > 0 else "0%")
+                
+                st.dataframe(result_df, use_container_width=True)
+                
+                # 下載結果
+                col_d1, col_d2 = st.columns(2)
+                
+                with col_d1:
+                    csv_data = result_df.to_csv(index=False).encode('utf-8-sig')
+                    st.download_button(
+                        "📥 下載完整結果 CSV",
+                        csv_data,
+                        "school_coordinates_result.csv",
+                        "text/csv"
+                    )
+                
+                with col_d2:
+                    missing_df = result_df[result_df['緯度'].isna()]
+                    if len(missing_df) > 0:
+                        missing_csv = missing_df.to_csv(index=False).encode('utf-8-sig')
+                        st.download_button(
+                            f"📥 下載未找到清單 ({len(missing_df)} 筆)",
+                            missing_csv,
+                            "missing_schools.csv",
+                            "text/csv"
+                        )
+        
+        except Exception as e:
+            st.error(f"檔案處理錯誤: {e}")
+            st.exception(e)
 
-# ==========================================
+# ============================
+# Tab 2: 地圖視覺化
+# ============================
+with tab2:
+    st.header("🗺️ 地圖視覺化")
+    
+    if 'result_df' not in st.session_state:
+        st.info("請先在「上傳轉檔」分頁處理資料")
+    elif not HAS_FOLIUM:
+        st.error("folium 未安裝，無法顯示地圖")
+    else:
+        result_df = st.session_state.result_df
+        map_df = result_df.dropna(subset=['緯度', '經度']).copy()
+        
+        if len(map_df) == 0:
+            st.warning("沒有有效座標的資料可顯示")
+        else:
+            map_type = st.radio("地圖類型", ["標記地圖", "熱力圖"], horizontal=True)
+            
+            center_lat = map_df['緯度'].mean()
+            center_lon = map_df['經度'].mean()
+            
+            m = folium.Map(location=[center_lat, center_lon], zoom_start=8)
+            
+            school_col = st.session_state.get('school_col', '學校')
+            student_col = st.session_state.get('student_col', '無')
+            
+            if map_type == "標記地圖":
+                for _, row in map_df.iterrows():
+                    school_name = str(row.get(school_col, ''))
+                    lat, lon = row['緯度'], row['經度']
+                    
+                    popup_text = f"<b>{school_name}</b><br>座標: ({lat:.4f}, {lon:.4f})"
+                    
+                    radius = 6
+                    if student_col != "無" and '學生數' in row:
+                        try:
+                            students = int(row['學生數'])
+                            popup_text += f"<br>學生數: {students}"
+                            radius = max(4, min(20, students / 100))
+                        except:
+                            pass
+                    
+                    folium.CircleMarker(
+                        location=[lat, lon],
+                        radius=radius,
+                        popup=folium.Popup(popup_text, max_width=300),
+                        color='blue',
+                        fill=True,
+                        fillColor='blue',
+                        fillOpacity=0.6
+                    ).add_to(m)
+            
+            else:  # 熱力圖
+                heat_data = [[row['緯度'], row['經度']] for _, row in map_df.iterrows()]
+                if student_col != "無" and '學生數' in map_df.columns:
+                    heat_data = [
+                        [row['緯度'], row['經度'], float(row.get('學生數', 1))]
+                        for _, row in map_df.iterrows()
+                    ]
+                HeatMap(heat_data).add_to(m)
+            
+            st_folium(m, width=None, height=600)
+            
+            st.caption(f"地圖顯示 {len(map_df)} 所學校")
+
+# ============================
 # Tab 3: 統計分析
-# ==========================================
+# ============================
 with tab3:
     st.header("📊 統計分析")
-
-    if st.session_state.processed_df is not None:
-        df_s = st.session_state.processed_df
-        school_col = "畢業學校" if "畢業學校" in df_s.columns else df_s.columns[0]
-
-        c1, c2 = st.columns(2)
-        with c1:
-            st.subheader("🏫 申請人數 TOP 20")
-            top = df_s[school_col].value_counts().head(20)
-            st.bar_chart(top)
-
-        with c2:
-            st.subheader("🗺️ 地區分布")
-            def region(lat, lon):
-                if pd.isna(lat) or pd.isna(lon): return "未知"
-                if lat >= 24.8: return "北部"
-                elif lat >= 24.0: return "中部"
-                elif lat >= 23.0: return "南部"
-                elif lon >= 121.0: return "東部"
-                else: return "離島/其他"
-            df_s["地區"] = df_s.apply(lambda r: region(r.get("學校緯度"), r.get("學校經度")), axis=1)
-            st.bar_chart(df_s["地區"].value_counts())
-
-        st.subheader("📋 完整統計表")
-        full = df_s.groupby(school_col).agg(
-            人數=(school_col, "count"),
-            緯度=("學校緯度", "first"),
-            經度=("學校經度", "first")
-        ).sort_values("人數", ascending=False).reset_index()
-        full.columns = ["學校", "人數", "緯度", "經度"]
-        st.dataframe(full, use_container_width=True, hide_index=True)
+    
+    if 'result_df' not in st.session_state:
+        st.info("請先在「上傳轉檔」分頁處理資料")
     else:
-        st.info("👈 請先完成轉換")
-
-# ==========================================
-# Tab 4: 手動編輯
-# ==========================================
-with tab4:
-    st.header("✏️ 手動編輯學校座標")
-
-    st.subheader("➕ 新增/修改")
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        new_school = st.text_input("學校名稱", placeholder="例：臺北市立建國高級中學")
-    with c2:
-        new_lat = st.number_input("緯度", value=23.5, min_value=21.0, max_value=27.0, format="%.6f")
-    with c3:
-        new_lon = st.number_input("經度", value=120.5, min_value=118.0, max_value=124.0, format="%.6f")
-
-    if st.button("💾 儲存"):
-        if new_school.strip():
-            st.session_state.school_db[new_school.strip()] = {
-                "lat": new_lat, "lon": new_lon, "source": "手動新增"
-            }
-            save_db(st.session_state.school_db)
-            st.success(f"✅ 已儲存：{new_school}")
-            st.rerun()
-
-    st.divider()
-
-    # 單一學校即時線上搜尋
-    st.subheader("🔍 即時搜尋單一學校")
-    st.caption("輸入任何學校名稱，系統會立即使用所有搜尋引擎尋找")
-    test_school = st.text_input("輸入學校名稱", key="test_search", placeholder="例：竹東高中")
-
-    if st.button("🌐 立即搜尋"):
-        if test_school.strip():
-            with st.spinner(f"正在搜尋 {test_school}..."):
-                search_log = []
-                lat, lon, source = search_all_engines(
-                    test_school.strip(),
-                    progress_callback=lambda msg: search_log.append(msg)
+        result_df = st.session_state.result_df
+        valid_df = result_df.dropna(subset=['緯度', '經度']).copy()
+        
+        if len(valid_df) == 0:
+            st.warning("沒有有效資料進行分析")
+        else:
+            # 地區分類
+            valid_df['地區'] = valid_df.apply(
+                lambda row: classify_region(row['緯度'], row['經度']), axis=1
+            )
+            
+            st.subheader("🗺️ 地區分布")
+            region_counts = valid_df['地區'].value_counts()
+            
+            col_r1, col_r2 = st.columns(2)
+            with col_r1:
+                st.dataframe(
+                    region_counts.reset_index().rename(
+                        columns={'index': '地區', '地區': '地區', 'count': '學校數'}
+                    ),
+                    use_container_width=True
                 )
-            if lat and lon:
-                st.success(f"✅ 找到！ {test_school} → ({lat:.6f}, {lon:.6f}) via {source}")
-                for sl in search_log:
-                    st.text(sl)
-                if st.button("💾 加入資料庫", key="add_search_result"):
-                    st.session_state.school_db[test_school.strip()] = {
-                        "lat": lat, "lon": lon, "source": f"即時搜尋({source})"
-                    }
-                    save_db(st.session_state.school_db)
-                    st.success("已加入資料庫！")
-                    st.rerun()
+            with col_r2:
+                st.bar_chart(region_counts)
+            
+            # 座標來源統計
+            st.subheader("📡 座標來源統計")
+            source_counts = result_df['座標來源'].value_counts()
+            st.bar_chart(source_counts)
+            
+            # 學生數排名
+            student_col = st.session_state.get('student_col', '無')
+            school_col = st.session_state.get('school_col', '學校')
+            
+            if student_col != "無" and '學生數' in valid_df.columns:
+                st.subheader("🏆 學生數排名 Top 20")
+                top20 = valid_df.nlargest(20, '學生數')[[school_col, '學生數', '地區']]
+                st.dataframe(top20, use_container_width=True)
+
+# ============================
+# Tab 4: 手動編輯
+# ============================
+with tab4:
+    st.header("✏️ 手動編輯與即時查詢")
+    
+    # 即時查詢
+    st.subheader("🔍 即時查詢單一學校")
+    query_name = st.text_input("輸入學校名稱", placeholder="例: 台北市立建國高級中學")
+    
+    if st.button("🔍 搜尋", key="btn_single_search"):
+        if query_name:
+            with st.spinner(f"搜尋中: {query_name}..."):
+                lat, lon, source, matched = lookup_school(query_name, db, use_online=True)
+            
+            if lat is not None:
+                st.success(f"✅ 找到！ {query_name}")
+                st.write(f"- 緯度: {lat:.6f}")
+                st.write(f"- 經度: {lon:.6f}")
+                st.write(f"- 來源: {source}")
+                if matched:
+                    st.write(f"- 匹配名稱: {matched}")
+                
+                if HAS_FOLIUM:
+                    m = folium.Map(location=[lat, lon], zoom_start=15)
+                    folium.Marker(
+                        [lat, lon],
+                        popup=query_name,
+                        icon=folium.Icon(color='red', icon='info-sign')
+                    ).add_to(m)
+                    st_folium(m, width=None, height=400)
             else:
-                st.error(f"❌ 所有引擎都找不到 {test_school}")
-                for sl in search_log:
-                    st.text(sl)
-
+                st.error(f"❌ 未找到: {query_name} ({source})")
+    
     st.divider()
+    
+    # 手動新增/修改
+    st.subheader("➕ 手動新增座標")
+    col_e1, col_e2, col_e3 = st.columns(3)
+    
+    with col_e1:
+        manual_name = st.text_input("學校名稱", key="manual_name")
+    with col_e2:
+        manual_lat = st.number_input("緯度", min_value=21.0, max_value=27.0, value=25.0, format="%.6f")
+    with col_e3:
+        manual_lon = st.number_input("經度", min_value=119.0, max_value=123.0, value=121.5, format="%.6f")
+    
+    if st.button("💾 儲存座標", key="btn_save_manual"):
+        if manual_name:
+            normalized = normalize_name(manual_name)
+            db[normalized] = {
+                "lat": manual_lat,
+                "lon": manual_lon,
+                "source": "手動輸入"
+            }
+            save_database(db)
+            st.success(f"已儲存: {normalized} ({manual_lat:.6f}, {manual_lon:.6f})")
+        else:
+            st.warning("請輸入學校名稱")
+    
+    st.divider()
+    
+    # 手動刪除
+    st.subheader("🗑️ 刪除資料庫項目")
+    if db:
+        delete_name = st.selectbox("選擇要刪除的學校", sorted(db.keys()))
+        if st.button("🗑️ 刪除", key="btn_delete"):
+            if delete_name in db:
+                del db[delete_name]
+                save_database(db)
+                st.success(f"已刪除: {delete_name}")
+                st.rerun()
 
-    st.subheader("📝 批次編輯資料庫")
-    if st.session_state.school_db:
-        db_df = pd.DataFrame([
-            {"學校名稱": k, "緯度": v["lat"], "經度": v["lon"], "來源": v.get("source", "")}
-            for k, v in st.session_state.school_db.items()
-        ]).sort_values("學校名稱").reset_index(drop=True)
-
-        edited = st.data_editor(db_df, use_container_width=True, num_rows="dynamic", key="db_ed")
-
-        if st.button("💾 儲存所有修改", type="primary"):
-            new_db = {}
-            for _, row in edited.iterrows():
-                name = str(row["學校名稱"]).strip()
-                if name and name != "nan":
-                    new_db[name] = {
-                        "lat": float(row["緯度"]),
-                        "lon": float(row["經度"]),
-                        "source": str(row.get("來源", "手動編輯"))
-                    }
-            st.session_state.school_db = new_db
-            save_db(new_db)
-            st.success(f"✅ 已更新！共 {len(new_db)} 所")
-            st.rerun()
-
-# ==========================================
+# ============================
 # 頁尾
-# ==========================================
+# ============================
 st.divider()
-st.caption(
-    "🔍 搜尋引擎順序：①資料庫直查 → ②正規化比對 → ③模糊比對 → "
-    "④Nominatim基本 → ⑤Nominatim結構化 → ⑥Photon(Komoot) → "
-    "⑦OSM API直查 → ⑧地址推測｜所有結果自動存入資料庫供下次使用"
-)
+st.caption("🏫 學校座標查詢系統 v2.0 | 分批處理版本 | 支援離線/線上混合查詢")
